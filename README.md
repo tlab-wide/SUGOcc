@@ -1,4 +1,8 @@
-# <center> SUGOcc: An Explicit Semantics and Uncertainty Guided Sparse Learning Framework for Real-Time 3D Occupancy Prediction 
+<div align="center">
+  
+# SUGOcc: An Explicit Semantics and Uncertainty Guided Sparse Learning Framework for Real-Time 3D Occupancy Prediction 
+
+</div>
 
 ## News
 
