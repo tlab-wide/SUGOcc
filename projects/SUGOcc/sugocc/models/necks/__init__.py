@@ -1,1 +1,1 @@
-from .generative_pixel_decoder import SparseGenerativePixelDecoder, CascadeDensifyPixelDecoder
+from .generative_pixel_decoder import SparseGenerativePixelDecoder

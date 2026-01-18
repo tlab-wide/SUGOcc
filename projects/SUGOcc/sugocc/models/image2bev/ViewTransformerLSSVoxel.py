@@ -305,7 +305,6 @@ class ViewTransformerLiftSplatShootVoxel(ViewTransformerLSSBEVDepth):
         )
         return seg_loss
 
-
     def voxel_pooling(self, geom_feats, x):
         B, N, D, H, W, C = x.shape
         Nprime = B * N * D * H * W
@@ -364,9 +363,8 @@ class ViewTransformerLiftSplatShootVoxel(ViewTransformerLSSBEVDepth):
         B, C, H, W = x.shape
         return x.softmax(dim=1)
     
-    def forward(self, input, is_training=True, gt_occ=None):
+    def forward(self, input):
         (x, rots, trans, intrins, post_rots, post_trans, bda, mlp_input) = input[:8]
-        devices = x.device
         B, N, C, H, W = x.shape
 
         x = x.view(B * N, C, H, W)

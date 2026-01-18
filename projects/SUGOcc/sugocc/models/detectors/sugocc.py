@@ -90,8 +90,8 @@ class SUGOcc(Base3DSegmentor):
         
         return fused_feats
 
-    def bev_encoder(self, x, img_metas=None, gt_occ=None):
-        pruning_feats = []
+    def bev_encoder(self, x):
+        voxel_seg_logits = []
         if self.record_time:
             torch.cuda.synchronize()
             t0 = time.time()
@@ -104,17 +104,17 @@ class SUGOcc(Base3DSegmentor):
             t1 = time.time()
             self.time_stats['bev_encoder'].append(t1 - t0)
         if self.img_bev_encoder_neck:
-            x, pruning_feats_neck, prune_seg_logits = self.img_bev_encoder_neck(x, img_metas, gt_occ)
-            pruning_feats.extend(pruning_feats_neck)
+            x, voxel_seg_logit = self.img_bev_encoder_neck(x)
+            voxel_seg_logits.extend(voxel_seg_logit)
         
         if self.record_time:
             torch.cuda.synchronize()
             t2 = time.time()
             self.time_stats['bev_neck'].append(t2 - t1)
         
-        return x, pruning_feats
+        return x, voxel_seg_logits
 
-    def extract_img_feat(self, img, img_metas, gt_occ=None):
+    def extract_img_feat(self, img):
         """Extract features of images."""
         # print(len(img[0]))
         if self.record_time:
@@ -133,25 +133,24 @@ class SUGOcc(Base3DSegmentor):
         
         mlp_input = self.img_view_transformer.get_mlp_input(rots, trans, intrins, post_rots, post_trans, bda)
         geo_inputs = [rots, trans, intrins, post_rots, post_trans, bda, mlp_input]
-        _s = time.time()
-        x, depth, seg = self.img_view_transformer([x] + geo_inputs, gt_occ=gt_occ)
 
+        x, depth, seg = self.img_view_transformer([x] + geo_inputs)
 
         if self.record_time:
             torch.cuda.synchronize()
             t2 = time.time()
             self.time_stats['view_transformer'].append(t2 - t1)
-        # print(x.shape)
-        x, pruning_feats = self.bev_encoder(x, img_metas, gt_occ)
+
+        x, voxel_seg_logits = self.bev_encoder(x)
         if type(x) is not list:
             x = [x]
         
-        return x, depth, seg, pruning_feats
+        return x, depth, seg, voxel_seg_logits
     
-    def extract_feat(self, points, img, img_metas, gt_occ=None):
+    def extract_feat(self, points, img):
         """Extract features from images and points."""
-        voxel_feats, depth, seg, pruning_feats  = self.extract_img_feat(img, img_metas, gt_occ)
-        return (voxel_feats, depth, seg, pruning_feats)
+        voxel_feats, depth, seg, voxel_seg_logits  = self.extract_img_feat(img)
+        return (voxel_feats, depth, seg, voxel_seg_logits)
 
     def _forward(self, batch_inputs: dict,
                 batch_data_samples: SampleList) -> SampleList:
@@ -191,7 +190,7 @@ class SUGOcc(Base3DSegmentor):
         for gt in batch_inputs['gt_occ']:
             gt_occ.append(torch.stack(gt, dim=0)) 
         img_metas = [data_sample.metainfo for data_sample in batch_data_samples]
-        outs = self.forward_test(img_metas=img_metas, img_inputs=img_inputs, gt_occ=gt_occ)
+        outs = self.forward_test(img_metas=img_metas, img_inputs=img_inputs)
         return self.postprocess_result(outs, batch_data_samples)
 
     def aug_test(self, batch_inputs, batch_data_samples):
@@ -227,7 +226,6 @@ class SUGOcc(Base3DSegmentor):
             torch.cuda.synchronize()
             t0 = time.time()
         
-        _s = time.time()
         losses = self.pts_bbox_head.forward_train(
             voxel_feats=pts_feats,
             img_metas=img_metas,
@@ -237,12 +235,10 @@ class SUGOcc(Base3DSegmentor):
             transform=transform,
             **kwargs,
         )
-        # print("head:", time.time()-_s)
         if self.record_time:
             torch.cuda.synchronize()
             t1 = time.time()
             self.time_stats['mask2former_head'].append(t1 - t0)
-        # print(losses)
         return losses
     
     def forward_train(self,
@@ -279,10 +275,8 @@ class SUGOcc(Base3DSegmentor):
         Returns:
             dict: Losses of different branches.
         """
-
-        # voxel_feats, depth, img_feats, occ_prob, pruning_feats, seg = self.extract_img_feat(img_inputs, img_metas, gt_occ)
-        voxel_feats, depth, seg, pruning_feats  = self.extract_feat(
-            points, img=img_inputs, img_metas=img_metas, gt_occ=gt_occ)
+        voxel_feats, depth, seg, voxel_seg_logits  = self.extract_feat(
+            points, img=img_inputs)
 
         losses = dict()
         
@@ -292,12 +286,7 @@ class SUGOcc(Base3DSegmentor):
 
         losses['loss_depth'] = self.img_view_transformer.get_depth_loss(img_inputs[7], depth)
         losses['loss_seg'] = self.img_view_transformer.get_seg_loss(seg, gt_occ, *img_inputs[1:7])
-        
-        if len(pruning_feats) > 0:
-            pruning_loss = 0
-            for loss in pruning_feats:
-                pruning_loss = pruning_loss + loss
-            losses["loss_pruning"] = pruning_loss
+        losses["loss_pruning"] = self.img_bev_encoder_neck.get_pruning_loss(voxel_seg_logits, gt_occ)
 
         if self.record_time:
             torch.cuda.synchronize()
@@ -310,7 +299,6 @@ class SUGOcc(Base3DSegmentor):
                                                   points_occ, img_metas, 
                                                   points_uv=points_uv, 
                                                   transform=transform, **kwargs)
-        # print(losses_occupancy)
         losses.update(losses_occupancy)
         if self.loss_norm:
             for loss_key in losses.keys():
@@ -337,7 +325,7 @@ class SUGOcc(Base3DSegmentor):
         return res
     
 
-    def simple_test(self, img_metas, img=None, rescale=False, points_occ=None, gt_occ=None, points_uv=None):
+    def simple_test(self, img_metas, img=None, rescale=False, points_occ=None, points_uv=None):
 
         x = self.image_encoder(img[0])
         
@@ -346,10 +334,9 @@ class SUGOcc(Base3DSegmentor):
         
         mlp_input = self.img_view_transformer.get_mlp_input(rots, trans, intrins, post_rots, post_trans, bda)
         geo_inputs = [rots, trans, intrins, post_rots, post_trans, bda, mlp_input]
-        x, _, _ = self.img_view_transformer([x] + geo_inputs, is_training=False)
-
+        x, _, _ = self.img_view_transformer([x] + geo_inputs)
         
-        x, pruning_feats = self.bev_encoder(x, img_metas)
+        x, _ = self.bev_encoder(x)
         if type(x) is not list:
             x = [x]
 

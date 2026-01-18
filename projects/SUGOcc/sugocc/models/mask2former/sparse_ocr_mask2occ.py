@@ -525,9 +525,6 @@ class SparseOCRMask2OccHead(MaskFormerHead):
     def forward_head(self, 
                      decoder_out, 
                      mask_feature, 
-                     attn_mask_target_size,
-                     coords,
-                     ori_size,
                      nonempty_mask=None):
         """Forward for head part which is called after every decoder layer.
 
@@ -567,24 +564,8 @@ class SparseOCRMask2OccHead(MaskFormerHead):
         mask_3d = empty_pred.reshape(empty_pred.shape[0], -1, 1, 1, 1)
         mask_3d = torch.where(nonempty_mask.unsqueeze(1).repeat(1, mask_pred.shape[1], 1, 1, 1), mask_pred, mask_3d)
         
-        ''' 对于一些样本数量较少的类别来说，经过 trilinear 插值 + 0.5 阈值，正样本直接消失 '''
-        with torch.no_grad():
-            if self.pooling_attn_mask:
-                # however, using max-pooling can save more positive samples, which is quite important for rare classes
-                attn_mask = F.adaptive_max_pool3d(mask_3d.float(), attn_mask_target_size)
-                # B, 
-            else:
-                # by default, we use trilinear interp for downsampling
-                attn_mask = F.interpolate(mask_3d, attn_mask_target_size, mode='trilinear', align_corners=self.align_corners)
-            
-            # merge the dims of [x, y, z]
-            attn_mask = attn_mask.flatten(2).detach() # detach the gradients back to mask_pred
-            attn_mask = attn_mask.sigmoid() < 0.5  # 
-            
-            # repeat for the num_head axis, (batch_size, num_queries, num_seq) -> (batch_size * num_head, num_queries, num_seq)
-            attn_mask = attn_mask.unsqueeze(1).repeat((1, self.num_heads, 1, 1)).flatten(0, 1)
         # print(mask_3d.shape)
-        return cls_pred, mask_3d, attn_mask
+        return cls_pred, mask_3d
 
     def preprocess_gt(self, gt_occ, img_metas):
         
@@ -785,15 +766,23 @@ class SparseOCRMask2OccHead(MaskFormerHead):
                 decoder layer. Each with shape (batch_size, num_queries, \
                  X, Y, Z).
         """
-        
         batch_size = len(img_metas)
-        mask_features = voxel_feats[0]  # B, C, W, H, D
+        mask_features = voxel_feats[0]
+        mask_features = mask_features.dense(
+            shape=torch.Size([
+                int(mask_features.C[:, 0].max() + 1), mask_features.F.shape[1],
+                self.final_occ_size[0]//(mask_features.tensor_stride[0]*self.lss_downsample[0]),
+                self.final_occ_size[1]//(mask_features.tensor_stride[1]*self.lss_downsample[1]),
+                self.final_occ_size[2]//(mask_features.tensor_stride[2]*self.lss_downsample[2])
+            ]),
+            min_coordinate=torch.IntTensor([0, 0, 0]),
+        )[0]  # B, C, W, H, D
         B, _, W, H, D = mask_features.shape
-        multi_scale_memorys = voxel_feats[:0:-1]
+        # multi_scale_memorys = voxel_feats[:0:-1]
         nonempty_mask = (mask_features.abs().sum(dim=1) > 0)  # B, W, H, 
 
         query_feat = self.query_feat.weight.unsqueeze(1).repeat((1, batch_size, 1))
-        query_embed = self.query_embed.weight.unsqueeze(1).repeat((1, batch_size, 1))
+        # query_embed = self.query_embed.weight.unsqueeze(1).repeat((1, batch_size, 1))
         scale = self.num_queries//self.num_classes
         global_prototypes = self.global_prototypes.weight.unsqueeze(1).repeat((scale, batch_size, 1))
         query_feat = self.query_inprojs[0](query_feat + global_prototypes)
@@ -811,11 +800,10 @@ class SparseOCRMask2OccHead(MaskFormerHead):
         mask_pred_list = []
         coarse_occ_list = []
 
-        cls_pred, mask_pred, attn_mask = self.forward_head(
-            query_feat, mask_features, 
-            multi_scale_memorys[0].shape[-3:],
-            None,
-            voxel_feats[0].shape[-3:], nonempty_mask=nonempty_mask)
+        cls_pred, mask_pred = self.forward_head(
+            query_feat, 
+            mask_features, 
+            nonempty_mask=nonempty_mask)
 
         cls_pred_list.append(cls_pred)
         mask_pred_list.append(mask_pred)
@@ -851,12 +839,9 @@ class SparseOCRMask2OccHead(MaskFormerHead):
                 query_key_padding_mask=None,
                 key_padding_mask=None)
             
-            cls_pred, mask_pred, attn_mask = self.forward_head(
+            cls_pred, mask_pred = self.forward_head(
                 query_feat, mask_features, 
-                multi_scale_memorys[(i + 1) % self.num_transformer_feat_level].shape[-3:],
-                None,
-                voxel_feats[0].shape[-3:], nonempty_mask=nonempty_mask)
-
+                nonempty_mask=nonempty_mask)
             cls_pred_list.append(cls_pred)
             mask_pred_list.append(mask_pred)
         
@@ -942,7 +927,7 @@ class SparseOCRMask2OccHead(MaskFormerHead):
             img_metas,
             **kwargs,
         ):
-        all_cls_scores, all_mask_preds, coarse_occ = self.forward(voxel_feats, img_metas)
+        all_cls_scores, all_mask_preds, _ = self.forward(voxel_feats, img_metas)
         mask_cls_results = all_cls_scores[-1]
         mask_pred_results = all_mask_preds[-1]
 

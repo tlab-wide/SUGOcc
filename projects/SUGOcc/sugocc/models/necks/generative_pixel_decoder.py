@@ -70,25 +70,10 @@ class MinkowskiUpAndPruneBlock(BaseModule):
                         ks=process_kernel_size, drop_path=0.2, cross_kernel=process_cross_kernel) for _ in range(process_block_num)]
         )
 
-        if dataset == 'semantickitti':
-            kitti_class_weights = 1 / np.log(semantic_kitti_class_frequencies)
-            norm_kitti_class_weights = kitti_class_weights / kitti_class_weights[0]
-            norm_kitti_class_weights = norm_kitti_class_weights.tolist()
-            norm_kitti_class_weights.append(0.1)
-            self.class_weight = norm_kitti_class_weights
-        elif dataset == 'nuscenes':
-            nuscenes_class_weights = 1 / np.log(nusc_class_frequencies)
-            norm_nuscenes_class_weights = nuscenes_class_weights / nuscenes_class_weights[0]
-            norm_nuscenes_class_weights = norm_nuscenes_class_weights.tolist()
-            norm_nuscenes_class_weights.append(0.1)
-            self.class_weight = norm_nuscenes_class_weights
-        else:
-            self.class_weight = [1.0] * nclasses + [0.1]
+        
         self.pruning = ME.MinkowskiPruning()
 
-    def forward(self, x, short_cut, gt_occ=None):
-        pruning_loss = 0.0
-
+    def forward(self, x, short_cut):
         seg = None
         x = self.upsample_layers[0](x)
             
@@ -100,33 +85,10 @@ class MinkowskiUpAndPruneBlock(BaseModule):
         seg_prob = F.softmax(seg.F, dim=-1)
 
         mask = mask | ((1 - seg_prob[:,self.empty_idx]) > self.pruning_ratio)
-
-        if gt_occ is not None:
-            down_gt = gt_occ[int(math.log2(x.tensor_stride[0]))+self.lss_downsample[0]//2].clone()
-            valid = down_gt[x.C[:, 0].long(),
-                        x.C[:,1].long()//(x.tensor_stride[0]),
-                        x.C[:,2].long()//(x.tensor_stride[0]),
-                        x.C[:,3].long()//(x.tensor_stride[0])]
-            nonempty = (valid != self.empty_idx)&(valid != 255)
-            if mask.sum() == 0:
-                mask = mask + nonempty
-            weight = 1
-            class_weights_tensor = torch.tensor(self.class_weight[:-1]).type_as(seg.F)
-            pruning_loss += CE_ssc_loss(seg.F, 
-                                        valid.long(), 
-                                        class_weights_tensor, 
-                                        ignore_index=255) * weight
-            pruning_loss += sem_scal_loss(seg.F,
-                                        valid.long(),
-                                        ignore_index=255,) * weight
-            pruning_loss += geo_scal_loss(seg.F,
-                                        valid.long(),
-                                        ignore_index=255,) * weight
-            pruning_loss += lovasz_softmax(torch.softmax(seg.F, dim=1),
-                                            valid.long(),
-                                            ignore=255,) * weight
+        if mask.sum() == 0:
+            mask = torch.ones_like(mask).bool().to(x.device)
         x = self.pruning(x, mask)
-        return x, pruning_loss, seg
+        return x, None, seg
     
 @MODELS.register_module()
 class SparseGenerativePixelDecoder(BaseModule):
@@ -209,144 +171,59 @@ class SparseGenerativePixelDecoder(BaseModule):
             else:
                 self.out_convs.append(None)
 
-    def forward(self, x, img_metas=None, gt_occ=None):
-        prune_loss = []
+        if dataset == 'semantickitti':
+            kitti_class_weights = 1 / np.log(semantic_kitti_class_frequencies)
+            norm_kitti_class_weights = kitti_class_weights / kitti_class_weights[0]
+            norm_kitti_class_weights = norm_kitti_class_weights.tolist()
+            norm_kitti_class_weights.append(0.1)
+            self.class_weight = norm_kitti_class_weights
+        elif dataset == 'nuscenes':
+            nuscenes_class_weights = 1 / np.log(nusc_class_frequencies)
+            norm_nuscenes_class_weights = nuscenes_class_weights / nuscenes_class_weights[0]
+            norm_nuscenes_class_weights = norm_nuscenes_class_weights.tolist()
+            norm_nuscenes_class_weights.append(0.1)
+            self.class_weight = norm_nuscenes_class_weights
+        else:
+            self.class_weight = [1.0] * nclasses + [0.1]
 
+    def forward(self, x):
+        prune_loss = []
         current_feat = x[-1]
         outputs = [self.out_convs[-1](current_feat) if self.out_convs[-1] else current_feat]
-        final_outs = [outputs[0].dense(
-                shape=torch.Size([int(outputs[0].C[:, 0].max()+1), outputs[0].F.shape[1],
-                                  self.voxel_size[0]//outputs[0].tensor_stride[0],
-                                  self.voxel_size[1]//outputs[0].tensor_stride[1],
-                                  self.voxel_size[2]//outputs[0].tensor_stride[2]]),
-                min_coordinate=torch.IntTensor([0, 0, 0]),
-            )[0]]
-        prune_seg_logits = []
+        final_outs = [outputs[0]]
+        seg_logits = []
         for i, up_layer in enumerate(self.upsample_blocks):
-            current_feat, prune_loss_i, seg_i = up_layer(current_feat, short_cut=x[len(x)-2-i], gt_occ=gt_occ)
+            current_feat, prune_loss_i, seg_i = up_layer(current_feat, short_cut=x[len(x)-2-i])
             if self.out_convs[len(self.out_convs)-2-i]:
                 out = self.out_convs[len(self.out_convs)-2-i](current_feat)
             else:
                 out = current_feat
-
-            if self.dense_output:
-                final_outs.insert(0, out.dense(
-                    shape=torch.Size([int(out.C[:, 0].max()+1), out.F.shape[1],
-                                      self.voxel_size[0]//out.tensor_stride[0],
-                                      self.voxel_size[1]//out.tensor_stride[1],
-                                      self.voxel_size[2]//out.tensor_stride[2]]),
-                    min_coordinate=torch.IntTensor([0, 0, 0]),
-                )[0])
-            else:
-                final_outs.insert(0, out)
+            final_outs.insert(0, out)
             prune_loss.append(prune_loss_i)
-            prune_seg_logits.insert(0, seg_i)
+            seg_logits.insert(0, seg_i)
 
-        return final_outs, prune_loss, prune_seg_logits
+        return final_outs, seg_logits
 
-@MODELS.register_module()
-class CascadeDensifyPixelDecoder(BaseModule):
-    """Generative Pixel Decoder for Sparse 3D Features
-
-    Args:
-        in_channels (list[int]): Input channels of each scale feature.
-        out_channels (int): Output channels of the decoder.
-        norm_cfg (dict): Config dict for normalization layer.
-        upsample_cfg (dict): Config dict for upsampling layer.
-        init_cfg (dict, optional): Init config for `BaseModule`. Defaults to None.
-    """
-
-    def __init__(self,
-                 in_channels,
-                 out_channels,
-                 norm_cfg=dict(type='BN1d'),
-                 upsample_cfg=dict(type='nearest', scale_factor=2),
-                 init_cfg=None):
-        super().__init__(init_cfg)
-
-        self.in_channels = in_channels
-        self.out_channels = out_channels
-        self.norm_cfg = norm_cfg
-        self.upsample_cfg = upsample_cfg
-
-        self.lateral_convs = nn.ModuleList()
-        self.fpn_convs = nn.ModuleList()
-        self.upsample_blocks = nn.ModuleList()
-        self.process_blocks = nn.ModuleList()
-        upsample_cfg=dict(type='deconv3d', bias=False)
-        norm_cfg=dict(type='GN', num_groups=32, requires_grad=True)
-        conv_cfg=dict(type='Conv3d', bias=False)
-        for i, in_channel in enumerate(self.in_channels):
-            if i == len(self.in_channels) - 1:
-                continue
-            up_layer = nn.Sequential(
-                build_upsample_layer(
-                    upsample_cfg,
-                    in_channels=self.in_channels[len(self.in_channels)-1-i],
-                    out_channels=self.in_channels[len(self.in_channels)-2-i],
-                    kernel_size=2,
-                    stride=2,
-                ),
-                build_norm_layer(norm_cfg, self.in_channels[len(self.in_channels)-2-i])[1],
-                nn.ReLU(inplace=True),
-            )
-            self.upsample_blocks.append(up_layer)
-            self.process_blocks.append(
-                nn.Sequential(
-                    build_conv_layer(
-                        conv_cfg,
-                        in_channels=2*self.in_channels[len(self.in_channels)-2-i],
-                        out_channels=self.in_channels[len(self.in_channels)-2-i],
-                        kernel_size=3,
-                        stride=1,
-                        padding=0),
-                    build_norm_layer(norm_cfg, self.in_channels[len(self.in_channels)-2-i])[1],
-                    nn.ReLU(inplace=True),
-                )
-            )
-
-        self.out_convs = nn.ModuleList()
-        for i in range(len(out_channels)):
-            if in_channels[i] != out_channels[i]:
-                self.out_convs.append(
-                    nn.Sequential(
-                        build_conv_layer(
-                            conv_cfg,
-                            in_channels=in_channels[i],
-                            out_channels=out_channels[i],
-                            kernel_size=1,
-                            stride=1,
-                            padding=0),
-                        build_norm_layer(norm_cfg, out_channels[i])[1],
-                        nn.ReLU(inplace=True),
-                    )
-                )
-            else:
-                self.out_convs.append(None)
-
-    def forward(self, x, img_metas=None, gt_occ=None):
-        prune_loss = []
-        B = int(x[0].C[:, 0].max()+1)
-        inputs = []
-        for i in range(len(x)):
-            ch = x[i].features.shape[1]
-            # np.save(f"8occ_down_coords_{self.downsample_rate[i]}.npy", outputs[i].coordinates.cpu().numpy())
-            d = x[i].dense(
-                shape=torch.Size([int(x[i].C[:, 0].max()+1), ch,
-                                  128//x[i].tensor_stride[0],
-                                  128//x[i].tensor_stride[1],
-                                  16//x[i].tensor_stride[2]]),
-                min_coordinate=torch.IntTensor([0, 0, 0]),
-            )[0]
-            inputs.append(d)
-        outputs = [inputs[-1]]
-        for i, up_layer in enumerate(self.upsample_blocks):
-            feat = torch.cat([up_layer(outputs[0]), inputs[len(inputs)-2-i]], dim=1)
-            feat = self.process_blocks[i](feat)
-            outputs.insert(0, feat)
-
-        for i in range(len(self.out_convs)):
-            if self.out_convs[i]:
-                outputs[i] = self.out_convs[i](outputs[i])
-        
-        return outputs, prune_loss
+    def get_pruning_loss(self, seg_logits, gt_occ):
+        pruning_loss = 0.0
+        for logits in seg_logits:
+            down_gt = gt_occ[int(math.log2(logits.tensor_stride[0]))+self.lss_downsample[0]//2].clone()
+            valid = down_gt[logits.C[:, 0].long(),
+                        logits.C[:,1].long()//(logits.tensor_stride[0]),
+                        logits.C[:,2].long()//(logits.tensor_stride[0]),
+                        logits.C[:,3].long()//(logits.tensor_stride[0])]
+            class_weights_tensor = torch.tensor(self.class_weight[:-1]).type_as(logits.F)
+            pruning_loss += CE_ssc_loss(logits.F, 
+                                        valid.long(), 
+                                        class_weights_tensor, 
+                                        ignore_index=255)
+            pruning_loss += sem_scal_loss(logits.F,
+                                        valid.long(),
+                                        ignore_index=255,)
+            pruning_loss += geo_scal_loss(logits.F,
+                                        valid.long(),
+                                        ignore_index=255,)
+            pruning_loss += lovasz_softmax(torch.softmax(logits.F, dim=1),
+                                            valid.long(),
+                                            ignore=255,)
+        return pruning_loss

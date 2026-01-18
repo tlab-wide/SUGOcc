@@ -69,9 +69,9 @@ grid_config = {
 }
 
 # settings for 3D encoder
-numC_Trans = 80
+numC_Trans = 40
 voxel_channels = [numC_Trans, numC_Trans*2, numC_Trans*4, numC_Trans*8]
-voxel_out_channels = 80
+voxel_out_channels = 40
 norm_cfg = dict(type='GN', num_groups=20, requires_grad=True)
 
 # settings for mask2former head
