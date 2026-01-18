@@ -71,14 +71,12 @@ class MinkowskiUNetEncoder(BaseModule):
                  voxel_size=[128,128,16],
                  num_dense_blocks=3,
                  kernel_size=3,
-                 dense_out=True,
                  cross_kernel=True,
                  init_cfg=None):
         super().__init__(init_cfg=init_cfg)
         self.voxel_size = voxel_size
         self.in_channels = in_channels
         self.out_channels = out_channels
-        self.dense_out = dense_out
         self.s1 = nn.Sequential(
             nn.Identity(),
             *[ResidualBlock(in_channels[0], in_channels[0], ks=kernel_size,

@@ -1,3 +1,3 @@
 from .efficientnet import CustomEfficientNet
-from .hrs_encoder_minkowski import MinkowskiUNetEncoder
 from .mmdet_wrapper import MMDetWrapper
+from .minkowski_encoder import MinkowskiUNetEncoder

@@ -117,7 +117,7 @@ class CustomNuScenesDatasetOccupancy(BaseDataset):
                  pipeline=None,
                  data_root=None,
                  classes=None,
-                 load_interval=100,
+                 load_interval=1,
                  with_velocity=True,
                  modality=None,
                  box_type_3d='LiDAR',

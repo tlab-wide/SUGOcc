@@ -25,25 +25,19 @@ class MinkowskiUpAndPruneBlock(BaseModule):
                  in_channels,
                  out_channels,
                  pruning_ratio=0.3,
-                 voxel_range=[128, 128, 16],
                  process_block_num=1,
                  process_kernel_size=1,
                  process_cross_kernel=False,
                  nclasses=20,
                  empty_idx=0,
-                 lss_downsample=[2,2,2],
-                 dataset = 'semantickitti',
                  init_cfg=None):
         super().__init__(init_cfg=init_cfg)
         self.in_channels = in_channels
         self.out_channels = out_channels
         self.pruning_ratio = pruning_ratio
-        self.voxel_range = voxel_range
         self.empty_idx = empty_idx
-        self.lss_downsample = lss_downsample
-        self.dataset = dataset
         self.upsample_layers = nn.ModuleList()
-        self.upsample_layers .append(
+        self.upsample_layers.append(
             nn.Sequential(
                 ME.MinkowskiGenerativeConvolutionTranspose(
                     in_channels=in_channels,
@@ -69,8 +63,6 @@ class MinkowskiUpAndPruneBlock(BaseModule):
             *[ResidualBlock(out_channels, out_channels, 
                         ks=process_kernel_size, drop_path=0.2, cross_kernel=process_cross_kernel) for _ in range(process_block_num)]
         )
-
-        
         self.pruning = ME.MinkowskiPruning()
 
     def forward(self, x, short_cut):
@@ -107,34 +99,19 @@ class SparseGenerativePixelDecoder(BaseModule):
                  process_block_num=1,
                  process_kernel_size=1,
                  nclasses=20,
-                 is_pruning=[True, True, True],
                  process_cross_kernel=False,
-                 generative=True,
-                 soft_pruning=False,
                  pruning_ratio=[0.5, 0.5, 0.5],
-                 voxel_size=[128,128,16],
-                 dense_output=True,
-                 norm_cfg=dict(type='BN1d'),
                  empty_idx=0,
                  lss_downsample=[2,2,2],
                  dataset='semantickitti',
-                 upsample_cfg=dict(type='nearest', scale_factor=2),
                  init_cfg=None):
         super().__init__(init_cfg)
 
         self.in_channels = in_channels
         self.out_channels = out_channels
-        self.norm_cfg = norm_cfg
-        self.upsample_cfg = upsample_cfg
-        self.voxel_size = voxel_size
-        self.is_pruning = is_pruning
-        self.dense_output = dense_output
         self.empty_idx = empty_idx
         self.lss_downsample = lss_downsample
-        self.lateral_convs = nn.ModuleList()
-        self.fpn_convs = nn.ModuleList()
         self.upsample_blocks = nn.ModuleList()
-        self.fusion_blocks = nn.ModuleList()
         for i, in_channel in enumerate(self.in_channels):
             if i == len(self.in_channels) - 1:
                 continue
@@ -142,14 +119,11 @@ class SparseGenerativePixelDecoder(BaseModule):
                 in_channels=self.in_channels[len(self.in_channels)-1-i],
                 out_channels=self.in_channels[len(self.in_channels)-2-i],
                 pruning_ratio=pruning_ratio[i],
-                voxel_range=self.voxel_size,
                 process_block_num=process_block_num,
                 process_kernel_size=process_kernel_size,
                 process_cross_kernel=process_cross_kernel,
                 empty_idx = self.empty_idx,
-                lss_downsample=self.lss_downsample,
                 nclasses = nclasses,
-                dataset=dataset,
             )
             self.upsample_blocks.append(up_layer)
 

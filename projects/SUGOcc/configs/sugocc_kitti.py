@@ -98,15 +98,14 @@ model = dict(
     ),
     img_bev_encoder_neck=dict(
         type='SparseGenerativePixelDecoder',
+        nclasses=num_class,
         in_channels=voxel_channels,
         out_channels=voxel_channels,
         process_block_num=2,
         process_kernel_size=3,
         process_cross_kernel=True,
-        soft_pruning=True,
         pruning_ratio=[0.1, 0.1, 0.1],
-        is_pruning=[True, True, True],
-        voxel_size=lss_occ_size,
+        lss_downsample=lss_downsample,
     ),
     pts_bbox_head=dict(
         type='SparseOCRMask2OccHead',
