@@ -1,1 +1,2 @@
+from .custom_fpn import CustomFPN
 from .generative_pixel_decoder import SparseGenerativePixelDecoder

@@ -196,7 +196,8 @@ class SparseGenerativePixelDecoder(BaseModule):
                                         ignore_index=255,)
             pruning_loss += geo_scal_loss(logits.F,
                                         valid.long(),
-                                        ignore_index=255,)
+                                        ignore_index=255,
+                                        non_empty_idx=self.empty_idx)
             pruning_loss += lovasz_softmax(torch.softmax(logits.F, dim=1),
                                             valid.long(),
                                             ignore=255,)

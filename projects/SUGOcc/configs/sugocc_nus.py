@@ -72,7 +72,7 @@ grid_config = {
 numC_Trans = 40
 voxel_channels = [numC_Trans, numC_Trans*2, numC_Trans*4, numC_Trans*8]
 voxel_out_channels = 40
-norm_cfg = dict(type='GN', num_groups=20, requires_grad=True)
+norm_cfg = dict(type='GN', num_groups=20, requires_grad=True)                                                       
 
 # settings for mask2former head
 mask2former_num_queries = 108
@@ -120,7 +120,7 @@ model = dict(
         out_channels=[voxel_out_channels for _ in voxel_channels],
     ),
     img_bev_encoder_neck=dict(
-        type='SparseGenerativePixelDecoder',
+        type='SparseGenerativePixelDecoder',git 
         nclasses=num_class,
         dataset='nuscenes',
         empty_idx=17,
@@ -334,7 +334,9 @@ val_evaluator = dict(type='CustomOccMetricNuscenes')
 
 test_evaluator = val_evaluator
 # learning policy
-param_scheduler = dict(type='MultiStepLR', by_epoch=True, milestones=[20, 25], gamma=0.1)
+param_scheduler = [
+    dict(type='MultiStepLR', by_epoch=True, milestones=[25, 30], gamma=0.1),
+    dict(type='LinearLR', by_epoch=False, end=200, start_factor=0.001),]
 
 # for most of these optimizer settings, we follow Mask2Former
 embed_multi = dict(lr_mult=1.0, decay_mult=0.0)
@@ -346,20 +348,20 @@ optim_wrapper = dict(
         weight_decay=0.01,
         eps=1e-8,
         betas=(0.9, 0.999),),
-    paramwise_cfg=dict(
-            custom_keys={
-                'query_embed': embed_multi,
-                'query_feat': embed_multi,
-                'level_embed': embed_multi,
-                'absolute_pos_embed': dict(decay_mult=0.),
-                'relative_position_bias_table': dict(decay_mult=0.),
-                'img_backbone': dict(lr_mult=0.1, decay_mult=1.0),
-            },
-            norm_decay_mult=0.0),
+    # paramwise_cfg=dict(
+    #         custom_keys={
+    #             'query_embed': embed_multi,
+    #             'query_feat': embed_multi,
+    #             'level_embed': embed_multi,
+    #             'absolute_pos_embed': dict(decay_mult=0.),
+    #             'relative_position_bias_table': dict(decay_mult=0.),
+    #             'img_backbone': dict(lr_mult=0.1, decay_mult=1.0),
+    #         },
+    #         norm_decay_mult=0.0),
     clip_grad=dict(max_norm=5, norm_type=2))
 
 # runtime settings
-randomness=dict(seed=0)
+# randomness=dict(seed=0)
 train_cfg = dict(by_epoch=True, max_epochs=24, val_interval=1)
 val_cfg = dict()
 test_cfg = dict()
@@ -378,4 +380,5 @@ custom_hooks = [
         priority='NORMAL',
     ),
 ]
+
 find_unused_parameters=True

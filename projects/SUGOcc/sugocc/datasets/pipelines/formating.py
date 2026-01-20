@@ -1,11 +1,17 @@
 # Copyright (c) OpenMMLab. All rights reserved.
-# from mmcv.parallel.data_container import DataContainer as DC
-from mmengine.structures import BaseDataElement as DC
+
+from typing import List, Sequence, Union
+import mmengine
+import numpy as np
+import torch
+from numpy import dtype
+
+from mmcv import BaseTransform
+from mmengine.structures import InstanceData
 from mmdet3d.registry import TRANSFORMS
-# from mmdet.datasets.pipelines import to_tensor
 from mmcv.transforms import to_tensor
-from mmdet3d.datasets.transforms import Pack3DDetInputs
-# from mmdet3d.datasets.transforms.formatting import to_tensor
+from mmdet3d.structures import BaseInstance3DBoxes, Det3DDataSample, PointData
+from mmdet3d.structures.points import BasePoints
 
 @TRANSFORMS.register_module()
 class OccDefaultFormatBundle3D:
@@ -47,20 +53,6 @@ class OccDefaultFormatBundle3D:
             results['points_uv'] = to_tensor(results['points_uv'])
 
         return results
-
-# Copyright (c) OpenMMLab. All rights reserved.
-from typing import List, Sequence, Union
-
-import mmengine
-import numpy as np
-import torch
-from mmcv import BaseTransform
-from mmengine.structures import InstanceData
-from numpy import dtype
-
-from mmdet3d.registry import TRANSFORMS
-from mmdet3d.structures import BaseInstance3DBoxes, Det3DDataSample, PointData
-from mmdet3d.structures.points import BasePoints
 
 
 def to_tensor(

@@ -215,16 +215,6 @@ class SparseOCRMask2OccHead(MaskFormerHead):
         self.refine_attns = nn.ModuleList()
         self.query_inprojs = nn.ModuleList()
         for i in range(self.num_transformer_decoder_layers):
-            # self.refine_attns.append(SparseVoxelRefinedAttn(
-            #     embed_dims=feat_channels,
-            #     num_heads=8,
-            #     num_levels=self.num_transformer_feat_level,
-            #     num_points=4,
-            #     mlp_ratio=4,
-            #     grid_config=grid_config,
-            #     data_config=data_config,
-            # ))
-
             self.coarse_occ_pred.append(nn.Sequential(
                 Conv3d(feat_channels, feat_channels//2, kernel_size=1, stride=1, padding=0),
                 # nn.GroupNorm(16, feat_channels//2),
@@ -972,7 +962,7 @@ class SparseOCRMask2OccHead(MaskFormerHead):
         class_weights_tensor = torch.tensor(self.class_weight[:-1]).type_as(output_voxels)
         loss_dict['loss_voxel_ce_{}'.format(tag)] = CE_ssc_loss(output_voxels, gt_occ, class_weights_tensor, ignore_index=255)
         loss_dict['loss_voxel_sem_scal_{}'.format(tag)] = sem_scal_loss(output_voxels, gt_occ, ignore_index=255)
-        loss_dict['loss_voxel_geo_scal_{}'.format(tag)] = geo_scal_loss(output_voxels, gt_occ, ignore_index=255, non_empty_idx=self.empty_idx)
+        loss_dict['loss_voxel_geo_scal_{}'.format(tag)] = geogit _scal_loss(output_voxels, gt_occ, ignore_index=255, non_empty_idx=self.empty_idx)
         loss_dict['loss_voxel_lovasz_{}'.format(tag)] = lovasz_softmax(torch.softmax(output_voxels, dim=1), gt_occ, ignore=255)
 
         return loss_dict
