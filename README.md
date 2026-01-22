@@ -39,7 +39,7 @@ If you find our work useful for your research, please consider citing the paper:
 ```bash
 @article{wu2026sug,
   title={SUG-Occ: An Explicit Semantics and Uncertainty Guided Sparse Learning Framework for Real-Time 3D Occupancy Prediction},
-  author={Wu, Hanlin and Lin, Pengfei and Javanmardi, Ehsan and Bao, Nanren and Qian, Bo and Si, Hao and Tsukada, Manabu},
+  author={Wu, Hanlin and Lin, Pengfei and Javanmardi, Ehsan and Bao, Naren and Qian, Bo and Si, Hao and Tsukada, Manabu},
   journal={arXiv preprint arXiv:2601.11396},
   year={2026}
 }
