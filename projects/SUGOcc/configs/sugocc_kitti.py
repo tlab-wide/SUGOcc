@@ -1,4 +1,4 @@
-_base_ = ['../../../configs/_base_/default_runtime.py']
+#_base_ = ['../../../configs/_base_/default_runtime.py']
 
 custom_imports = dict(imports=['projects.SUGOcc.sugocc'], allow_failed_imports=False)
 
@@ -68,7 +68,7 @@ model = dict(
         num_outs=4,
         checkpoint_path='ckpts/maskdino_r50_50e_300q_panoptic_pq53.0.pth'),
     img_neck=dict(
-        type='SECONDFPN',
+        type='mmdet3d.SECONDFPN',
         in_channels=[256, 256, 256, 256, 256],
         upsample_strides=[0.25, 0.5, 1,2,4],
         out_channels=[128, 128, 128, 128, 128]),
