@@ -11,7 +11,7 @@ import torch.nn.functional as F
 import pdb
 # from mmdet3d.models import builder
 from .ViewTransformerLSSBEVDepth import *
-from mmdet3d.registry import MODELS
+from mmengine.registry import MODELS
 import MinkowskiEngine as ME
 import torch
 import math

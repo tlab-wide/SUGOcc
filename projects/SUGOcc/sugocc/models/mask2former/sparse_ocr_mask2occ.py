@@ -962,7 +962,7 @@ class SparseOCRMask2OccHead(MaskFormerHead):
         class_weights_tensor = torch.tensor(self.class_weight[:-1]).type_as(output_voxels)
         loss_dict['loss_voxel_ce_{}'.format(tag)] = CE_ssc_loss(output_voxels, gt_occ, class_weights_tensor, ignore_index=255)
         loss_dict['loss_voxel_sem_scal_{}'.format(tag)] = sem_scal_loss(output_voxels, gt_occ, ignore_index=255)
-        loss_dict['loss_voxel_geo_scal_{}'.format(tag)] = geogit _scal_loss(output_voxels, gt_occ, ignore_index=255, non_empty_idx=self.empty_idx)
+        loss_dict['loss_voxel_geo_scal_{}'.format(tag)] = geo_scal_loss(output_voxels, gt_occ, ignore_index=255, non_empty_idx=self.empty_idx)
         loss_dict['loss_voxel_lovasz_{}'.format(tag)] = lovasz_softmax(torch.softmax(output_voxels, dim=1), gt_occ, ignore=255)
 
         return loss_dict
