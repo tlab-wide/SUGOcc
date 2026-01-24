@@ -19,7 +19,7 @@ from scipy.stats import norm
 import numpy as np
 # from mmdet3d.models import builder
 import pdb
-from mmdet3d.registry import MODELS
+from mmengine.registry import MODELS
 
 def gen_dx_bx(xbound, ybound, zbound):
     dx = torch.Tensor([row[2] for row in [xbound, ybound, zbound]])
