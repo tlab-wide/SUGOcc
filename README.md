@@ -95,7 +95,7 @@ bash tools/dist_train.sh projects/SUGOcc/configs/$CONFIG $GPUS
 ```
 #### Evaluation
 ```python
-bash tools/dist_test.sh projects/SUGOcc/configs/$CONFIG $PTH $GPUS
+bash tools/dist_test.sh projects/SUGOcc/configs/$CONFIG $PTH 1
 ```
 ## Results
 #### Results on SemanticKITTI
