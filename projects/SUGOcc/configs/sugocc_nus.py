@@ -118,7 +118,7 @@ model = dict(
         out_channels=[voxel_out_channels for _ in voxel_channels],
     ),
     img_bev_encoder_neck=dict(
-        type='SparseGenerativePixelDecoder',git 
+        type='SparseGenerativePixelDecoder', 
         nclasses=num_class,
         dataset='nuscenes',
         empty_idx=17,
