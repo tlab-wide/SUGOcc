@@ -2,7 +2,7 @@ import numpy as np
 import glob
 import os
 
-from mmdet3d.registry import DATASETS
+from mmengine.registry import DATASETS
 from mmengine.dataset import BaseDataset
 # from mmdet3d.datasets import SemanticKITTIDataset
 

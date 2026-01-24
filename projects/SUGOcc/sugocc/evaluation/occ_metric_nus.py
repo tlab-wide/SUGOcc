@@ -21,7 +21,7 @@ from functools import reduce
 from mmengine.evaluator import BaseMetric
 from mmengine.logging import MMLogger
 from mmdet3d.evaluation import seg_eval
-from mmdet3d.registry import METRICS
+from mmengine.registry import METRICS
 
 np.seterr(divide='ignore', invalid='ignore')
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"

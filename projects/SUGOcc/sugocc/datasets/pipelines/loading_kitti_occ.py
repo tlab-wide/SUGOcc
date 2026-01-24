@@ -1,7 +1,7 @@
 
 import numpy as np
 import torch
-from mmdet3d.registry import TRANSFORMS
+from mmengine.registry import TRANSFORMS
 from PIL import Image
 import pdb
 

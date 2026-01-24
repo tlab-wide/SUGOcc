@@ -12,7 +12,7 @@ from mmdet3d.structures.points import BasePoints, get_points_type
 from mmdet.datasets.transforms import LoadAnnotations
 from mmcv.transforms.loading import LoadImageFromFile
 from mmdet3d.structures import LiDARInstance3DBoxes
-from mmdet3d.registry import TRANSFORMS
+from mmengine.registry import TRANSFORMS
 # from mmdet3d.datasets.builder import PIPELINES
 from torchvision.transforms.functional import rotate
 from copy import deepcopy

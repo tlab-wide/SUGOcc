@@ -18,7 +18,7 @@ from torchmetrics.metric import Metric
 from mmengine.evaluator import BaseMetric
 from mmengine.logging import MMLogger
 from mmdet3d.evaluation import seg_eval
-from mmdet3d.registry import METRICS
+from mmengine.registry import METRICS
 
 LABEL2CAT = {
     0: 'unlabeled', 

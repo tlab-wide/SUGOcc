@@ -3,7 +3,7 @@ import mmcv
 import numpy as np
 import mmcv
 import os
-from mmdet3d.registry import TRANSFORMS
+from mmengine.registry import TRANSFORMS
 
 import torch
 from PIL import Image

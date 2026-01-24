@@ -8,7 +8,7 @@ from numpy import dtype
 
 from mmcv import BaseTransform
 from mmengine.structures import InstanceData
-from mmdet3d.registry import TRANSFORMS
+from mmengine.registry import TRANSFORMS
 from mmcv.transforms import to_tensor
 from mmdet3d.structures import BaseInstance3DBoxes, Det3DDataSample, PointData
 from mmdet3d.structures.points import BasePoints

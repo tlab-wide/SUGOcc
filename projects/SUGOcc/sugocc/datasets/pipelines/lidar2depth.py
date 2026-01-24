@@ -2,7 +2,7 @@
 import numpy as np
 import torch
 import os
-from mmdet3d.registry import TRANSFORMS
+from mmengine.registry import TRANSFORMS
 import pdb
 from copy import deepcopy
 # import open3d as o3d

@@ -15,9 +15,8 @@ import mmengine
 from mmdet3d.structures.points import lidar_points
 from .ego_pose_dataset import EgoPoseDataset
 from torch.utils.data import DataLoader
-from mmdet3d.registry import DATASETS
 from mmengine.dataset import BaseDataset
-from mmdet3d.registry import DATASETS
+from mmengine.registry import DATASETS
 from mmdet3d.structures import Box3DMode, Coord3DMode, LiDARInstance3DBoxes
 from mmengine.dataset import Compose
 from mmdet3d.structures import get_box_type
