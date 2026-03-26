@@ -244,7 +244,7 @@ def get_uncertain_point_coords_3d_with_frequency(
         )
         point_indices = torch.cat((point_indices, rand_indices), dim=1)
         point_coords = torch.cat((point_coords, rand_coords), dim=1)
-    # print("final point_coords shape:", point_coords.shape)
+
     return point_indices, point_coords
 
 def filter_scores_and_topk(scores, score_thr, topk, results=None):

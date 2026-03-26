@@ -26,17 +26,18 @@ class DenseNet(BaseModule):
                  in_channels=128,
                  num_blocks=9,
                  out_channels=192,
+                 kernels=[(7, 7, 3), (11, 11, 3), (15, 15, 3)],
                  init_cfg=None):
         super().__init__(init_cfg=init_cfg)
         self.layers = nn.ModuleList()
         for _ in range(num_blocks):
             self.layers.append(
-                MSCABlock(dim=in_channels)
+                MSCABlock(dim=in_channels, kernels=kernels)
             )
         self.init_weights()
     
     def forward(self, x, voxel_shape=[16,16,2]):
-
+        
         tensor_stride = x.tensor_stride[0]
         coordinate_manager = x.coordinate_manager
         x = x.dense(
@@ -64,7 +65,8 @@ class DenseNet(BaseModule):
 
 @MODELS.register_module()
 class MinkowskiUNetEncoder(BaseModule):
-    def __init__(self, 
+    def __init__(self,
+                 numC_input=128,
                  in_channels=[128, 256, 512, 1024],
                  out_channels=[128, 256, 512, 1024],
                  num_blocks=[2,2,2,2],
@@ -72,43 +74,47 @@ class MinkowskiUNetEncoder(BaseModule):
                  num_dense_blocks=3,
                  kernel_size=3,
                  cross_kernel=True,
+                 dense_kernels=[(7, 7, 3), (11, 11, 3), (15, 15, 3)],
                  init_cfg=None):
         super().__init__(init_cfg=init_cfg)
         self.voxel_size = voxel_size
         self.in_channels = in_channels
         self.out_channels = out_channels
+        self.numC_input = numC_input
         self.s1 = nn.Sequential(
-            nn.Identity(),
+            nn.Identity() if numC_input == in_channels[0] else ME.MinkowskiConvolution(
+                numC_input, in_channels[0], kernel_size=1, stride=1, dimension=3
+            ),
             *[ResidualBlock(in_channels[0], in_channels[0], ks=kernel_size,
-                           cross_kernel=cross_kernel, expand_coords=False) for _ in range(num_blocks[0])]
+                           cross_kernel=cross_kernel, voxel_range=voxel_size) for _ in range(num_blocks[0])]
         )
         self.s1s2 = nn.Sequential(
             BasicConvolutionBlock(in_channels[0], in_channels[1], ks=2, stride=2),
             *[ResidualBlock(in_channels[1], in_channels[1], ks=kernel_size, 
-                           cross_kernel=cross_kernel) for _ in range(num_blocks[1])]
+                           cross_kernel=cross_kernel, voxel_range=voxel_size) for _ in range(num_blocks[1])]
         )
         
         self.s2s4 = nn.Sequential(
             BasicConvolutionBlock(in_channels[1], in_channels[2], ks=2, stride=2),
             *[ResidualBlock(in_channels[2], in_channels[2], ks=kernel_size,
-                           cross_kernel=cross_kernel) for _ in range(num_blocks[2])]
+                           cross_kernel=cross_kernel, voxel_range=voxel_size) for _ in range(num_blocks[2])]
         )
 
         self.s4s8 = nn.Sequential(
             BasicConvolutionBlock(in_channels[2], in_channels[3], ks=2, stride=2),
             *[ResidualBlock(in_channels[3], in_channels[3], ks=kernel_size,
-                           cross_kernel=cross_kernel) for _ in range(num_blocks[3])]
-        )
+                           cross_kernel=cross_kernel, voxel_range=voxel_size) for _ in range(num_blocks[3])]
+        ) if len(in_channels) > 3 else None
         self.voxel_size = voxel_size
         self.dense_net = DenseNet(
-            in_channels=in_channels[3],
+            in_channels=in_channels[-1],
             num_blocks=num_dense_blocks,
-            out_channels=in_channels[3],
+            out_channels=in_channels[-1],
+            kernels=dense_kernels,
         )
         self.init_weights()
     
     def forward(self, x):
-        _s = time.time()
         if not isinstance(x, ME.SparseTensor):
             B, C, X, Y, Z = x.shape
             x = ME.to_sparse(x)
@@ -118,9 +124,17 @@ class MinkowskiUNetEncoder(BaseModule):
             X, Y, Z = self.voxel_size
 
         x1 = self.s1(x)
-        x2 = self.s1s2(x1)
-        x3 = self.s2s4(x2)
-        x4 = self.s4s8(x3)
 
-        x4 = self.dense_net(x4, voxel_shape=[X//8, Y//8, Z//8])
-        return [x1, x2, x3, x4]
+        x2 = self.s1s2(x1)
+
+        x3 = self.s2s4(x2)
+
+        bottle_feats = self.s4s8(x3)
+
+        bottle_feats = self.dense_net(bottle_feats, 
+                            voxel_shape=[
+                                X//(2**(len(self.in_channels)-1)), 
+                                Y//(2**(len(self.in_channels)-1)), 
+                                Z//(2**(len(self.in_channels)-1))])
+
+        return [x1, x2, x3, bottle_feats]

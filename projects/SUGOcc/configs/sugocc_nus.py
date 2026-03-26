@@ -37,9 +37,9 @@ lss_occ_size = [occ_size[0] // lss_downsample[0],
                 occ_size[1] // lss_downsample[1],
                 occ_size[2] // lss_downsample[2]]
 
-voxel_x = (point_cloud_range[3] - point_cloud_range[0]) / occ_size[0]
-voxel_y = (point_cloud_range[4] - point_cloud_range[1]) / occ_size[1]
-voxel_z = (point_cloud_range[5] - point_cloud_range[2]) / occ_size[2]
+voxel_x = (point_cloud_range[3] - point_cloud_range[0]) / lss_occ_size[0]
+voxel_y = (point_cloud_range[4] - point_cloud_range[1]) / lss_occ_size[1]
+voxel_z = (point_cloud_range[5] - point_cloud_range[2]) / lss_occ_size[2]
 voxel_size = [voxel_x, voxel_y, voxel_z]
 
 data_config = {
@@ -60,44 +60,62 @@ data_config = {
 }
 
 grid_config = {
-    'xbound': [-40, 40, 0.4],
-    'ybound': [-40, 40, 0.4],
-    'zbound': [-1, 5.4, 0.4],
-    'dbound': [1.0, 45.0, 0.5],
+    'xbound': [-40, 40, voxel_x],
+    'ybound': [-40, 40, voxel_y],
+    'zbound': [-1, 5.4, voxel_z],
+    'dbound': [1.0, 45.0, 0.5*lss_downsample[0]],
 }
 
 # settings for 3D encoder
-numC_Trans = 40
-voxel_channels = [numC_Trans, numC_Trans*2, numC_Trans*4, numC_Trans*8]
-voxel_out_channels = 40
-norm_cfg = dict(type='GN', num_groups=20, requires_grad=True)                                                       
+numC_Trans = 80
+
+voxel_in_channels = [numC_Trans, numC_Trans*2, numC_Trans*4, numC_Trans*8]
+voxel_out_channel = 48
+voxel_out_channels = [voxel_out_channel, 
+                  voxel_out_channel*2, 
+                  voxel_out_channel*4, 
+                  voxel_out_channel*8]
+norm_cfg = dict(type='GN', num_groups=24, requires_grad=True)                                                       
 
 # settings for mask2former head
 mask2former_num_queries = 108
-mask2former_feat_channel = voxel_out_channels
-mask2former_output_channel = voxel_out_channels
+mask2former_feat_channel = voxel_out_channel
+mask2former_output_channel = voxel_out_channel
 mask2former_pos_channel = mask2former_feat_channel / 3 # divided by ndim
-mask2former_num_heads = voxel_out_channels // 32
+mask2former_num_heads = 8
+
+not_use_mask = True
 
 model = dict(
     type='SUGOcc',
+    dataset='nuscenes',
     img_backbone=dict(
-        type='MMDetWrapper',
-        config_path='maskdino/configs/maskdino_r50_8xb2-panoptic-export.py',
-        custom_imports='maskdino',
-        num_outs=4,
-        checkpoint_path='ckpts/maskdino_r50_50e_300q_panoptic_pq53.0.pth'),
+        # pretrained='torchvision://resnet50',
+        # pretrained='ckpts/resnet50-0676ba61.pth',
+        type='mmdet.ResNet',
+        depth=50,
+        num_stages=4,
+        out_indices=(0,2,3),
+        frozen_stages=-1,
+        norm_cfg=dict(type='BN', requires_grad=True),
+        norm_eval=False,
+        with_cp=True,
+        style='pytorch'),
     img_neck=dict(
-        type='mmdet3d.SECONDFPN',
-        in_channels=[256, 256, 256, 256, 256],
-        upsample_strides=[0.25, 0.5, 1,2,4],
-        out_channels=[128, 128, 128, 128, 128]),
+        type='CustomFPN',
+        in_channels=[1024, 2048],
+        out_channels=512,
+        num_outs=1,
+        start_level=0,
+        with_cp=True,
+        out_ids=[0]),
     img_view_transformer=dict(
         type='ViewTransformerLiftSplatShootVoxel',
-        numC_input=640,
+        numC_input=512,
         cam_channels=27,
-        loss_depth_weight=1.0,
+        loss_depth_weight=3.0,
         downsample=16,
+        num_cam=1,
         num_classes=num_class,
         grid_config=grid_config,
         data_config=data_config,
@@ -106,29 +124,40 @@ model = dict(
         vp_megvii=False,
         lss_downsample=lss_downsample,
         grid_size=lss_occ_size,
+        dataset='nuscenes',
+        seg_pruning_ratio=0.1,
+        depth_pruning_ratio=0.1,
+        depthnet_cfg=dict(
+            use_dcn=False,
+            aspp_mid_channels=96,
+        )
     ),
     img_bev_encoder_backbone=dict(
         type='MinkowskiUNetEncoder',
-        in_channels=voxel_channels,
+        numC_input=numC_Trans,
+        in_channels=voxel_out_channels,
         num_blocks=[2,2,2,2],
         num_dense_blocks=3,
         kernel_size=3,
         cross_kernel=True,
         voxel_size=lss_occ_size,
-        out_channels=[voxel_out_channels for _ in voxel_channels],
+        dense_kernels=[(7, 7, 3), (11, 11, 3), (21, 21, 3)],
+        out_channels=voxel_out_channels,
     ),
     img_bev_encoder_neck=dict(
         type='SparseGenerativePixelDecoder', 
         nclasses=num_class,
         dataset='nuscenes',
         empty_idx=17,
-        in_channels=voxel_channels,
-        out_channels=voxel_channels,
-        process_block_num=2,
+        wo_mask=not_use_mask,
+        in_channels=voxel_out_channels,
+        out_channels=voxel_out_channels,
+        process_block_num=[2, 2, 2],
         process_kernel_size=3,
         process_cross_kernel=True,
         pruning_ratio=[0.1, 0.1, 0.1],
         lss_downsample=lss_downsample,
+        voxel_range=lss_occ_size,
     ),
     pts_bbox_head=dict(
         type='SparseOCRMask2OccHead',
@@ -137,13 +166,15 @@ model = dict(
         lss_downsample=lss_downsample,
         norm_cfg=norm_cfg,
         dataset='nuscenes',
+        # wo_assigner=True,
+        wo_mask=not_use_mask,
         num_queries=mask2former_num_queries,
         num_occupancy_classes=num_class,
         pooling_attn_mask=True,
         sparse_input=True,
         sample_weight_gamma=0.25,
         cascade_ratio=2,
-        dn_num=20,
+        dn_num=18,
         fine_topk=30000,
         empty_idx=17,
         final_occ_size=occ_size,
@@ -165,7 +196,7 @@ model = dict(
                     type='MultiheadAttention',
                     embed_dims=mask2former_feat_channel,
                     num_heads=mask2former_num_heads,
-                    attn_drop=0.0,
+                    attn_drop=0.1,
                     proj_drop=0.0,
                     dropout_layer=None,
                     batch_first=False),
@@ -174,14 +205,13 @@ model = dict(
                     feedforward_channels=mask2former_feat_channel * 8,
                     num_fcs=2,
                     act_cfg=dict(type='ReLU', inplace=True),
-                    ffn_drop=0.0,
+                    ffn_drop=0.1,
                     dropout_layer=None,
                     add_identity=True),
                 feedforward_channels=mask2former_feat_channel * 8,
                 operation_order=('cross_attn', 'norm','self_attn', 'norm',
                                  'ffn', 'norm')),
             init_cfg=None),
-        # loss settings
         loss_cls=dict(
             type='mmdet.CrossEntropyLoss',
             use_sigmoid=False,
@@ -205,7 +235,7 @@ model = dict(
     ),
     train_cfg=dict(
         pts=dict(
-            num_points=12544 * 4,
+            num_points=12544 * 2,   
             oversample_ratio=3.0,
             importance_sample_ratio=0.75,
             assigner=dict(
@@ -245,9 +275,9 @@ train_pipeline = [
         bda_aug_conf=bda_aug_conf,
         classes=class_names,
         is_train=True),
-    dict(type='LoadOccGTFromFile',ignore_nonvisible=True),
+    dict(type='LoadOccGTFromFile',ignore_nonvisible=not not_use_mask),
     dict(
-        type='LoadPointsFromFile',
+        type='mmdet3d.LoadPointsFromFile',
         coord_type='LIDAR',
         load_dim=5,
         use_dim=5,),
@@ -265,23 +295,27 @@ test_pipeline = [
         bda_aug_conf=bda_aug_conf,
         classes=class_names,
         is_train=False),
-    dict(type='LoadOccGTFromFile',ignore_nonvisible=True),
+    # dict(type='LoadOccGTFromFile',ignore_nonvisible=not not_use_mask),
     dict(
-        type='LoadPointsFromFile',
+        type='mmdet3d.LoadPointsFromFile',
         coord_type='LIDAR',
         load_dim=5,
         use_dim=5,),
     dict(
-        type='MultiScaleFlipAug3D',
-        img_scale=(1333, 800),
-        pts_scale_ratio=1,
-        flip=False,
-        transforms=[
-            dict(
-                type='OccDefaultFormatBundle3D'),
-            dict(type='CustomPack3DDetInputs', keys=['img_inputs', 'gt_occ'],
-                 meta_keys=['pc_range', 'occ_size','sample_idx','filename']),
-        ])
+        type='OccDefaultFormatBundle3D'),
+    dict(type='CustomPack3DDetInputs', keys=['img_inputs'],
+            meta_keys=['pc_range', 'occ_size','sample_idx','filename']),
+    # dict(
+    #     type='mmdet3d.MultiScaleFlipAug3D',
+    #     img_scale=(1333, 800),
+    #     pts_scale_ratio=1,
+    #     flip=False,
+    #     transforms=[
+    #         dict(
+    #             type='OccDefaultFormatBundle3D'),
+    #         dict(type='CustomPack3DDetInputs', keys=['img_inputs', 'gt_occ'],
+    #              meta_keys=['pc_range', 'occ_size','sample_idx','filename']),
+    #     ])
 ]
 
 input_modality = dict(
@@ -292,10 +326,10 @@ input_modality = dict(
     use_external=False)
 
 train_dataloader = dict(
-    batch_size=4,
+    batch_size=1,
     num_workers=8,
     persistent_workers=True,
-    sampler=dict(type='DefaultSampler', shuffle=True),
+    sampler=dict(type='DefaultSampler', shuffle=True, seed=0),
     dataset=dict(
         type=dataset_type,
         data_root=data_root,
@@ -305,6 +339,7 @@ train_dataloader = dict(
         modality=input_modality,
         test_mode=False,
         img_info_prototype='bevdet',
+        filter_empty_gt =False,
         occ_size=occ_size,
         pc_range=point_cloud_range,
     ))
@@ -312,7 +347,8 @@ val_dataloader = dict(
     batch_size=1,
     num_workers=8,
     persistent_workers=True,
-    drop_last=False,
+    # drop_last=True,
+    pin_memory=True,
     sampler=dict(type='DefaultSampler', shuffle=False),
     dataset=dict(
         type=dataset_type,
@@ -322,6 +358,7 @@ val_dataloader = dict(
         classes=class_names,
         modality=input_modality,
         test_mode=True,
+        filter_empty_gt =False,
         img_info_prototype='bevdet',
         occ_size=occ_size,
         pc_range=point_cloud_range,
@@ -333,8 +370,9 @@ val_evaluator = dict(type='CustomOccMetricNuscenes')
 test_evaluator = val_evaluator
 # learning policy
 param_scheduler = [
-    dict(type='MultiStepLR', by_epoch=True, milestones=[25, 30], gamma=0.1),
-    dict(type='LinearLR', by_epoch=False, end=200, start_factor=0.001),]
+    dict(type='MultiStepLR', by_epoch=True, milestones=[100], gamma=0.1),
+    dict(type='LinearLR', by_epoch=False, end=200, start_factor=0.001),
+]
 
 # for most of these optimizer settings, we follow Mask2Former
 embed_multi = dict(lr_mult=1.0, decay_mult=0.0)
@@ -342,25 +380,26 @@ optim_wrapper = dict(
     type='OptimWrapper',
     optimizer=dict(
         type='AdamW',
-        lr=2e-4,
+        lr=4e-4,
         weight_decay=0.01,
-        eps=1e-8,
-        betas=(0.9, 0.999),),
+        # eps=1e-8,
+        # betas=(0.9, 0.999),
+    ),
     # paramwise_cfg=dict(
-    #         custom_keys={
-    #             'query_embed': embed_multi,
-    #             'query_feat': embed_multi,
-    #             'level_embed': embed_multi,
-    #             'absolute_pos_embed': dict(decay_mult=0.),
-    #             'relative_position_bias_table': dict(decay_mult=0.),
-    #             'img_backbone': dict(lr_mult=0.1, decay_mult=1.0),
-    #         },
-    #         norm_decay_mult=0.0),
+    #     custom_keys={
+    #         'query_embed': embed_multi,
+    #         'query_feat': embed_multi,
+    #         'level_embed': embed_multi,
+    #         'absolute_pos_embed': dict(decay_mult=0.),
+    #         'relative_position_bias_table': dict(decay_mult=0.),
+    #         'img_backbone': dict(lr_mult=0.1, decay_mult=1.0),
+    #     },
+    #     norm_decay_mult=0.0),
     clip_grad=dict(max_norm=5, norm_type=2))
 
 # runtime settings
-# randomness=dict(seed=0)
-train_cfg = dict(by_epoch=True, max_epochs=24, val_interval=1)
+randomness=dict(seed=0)
+train_cfg = dict(by_epoch=True, max_epochs=100, val_interval=1)
 val_cfg = dict()
 test_cfg = dict()
 
@@ -378,5 +417,5 @@ custom_hooks = [
         priority='NORMAL',
     ),
 ]
-
-find_unused_parameters=True
+load_from='ckpts/bevdet-r50-4d-depth-cbgs.pth'
+# find_unused_parameters=True

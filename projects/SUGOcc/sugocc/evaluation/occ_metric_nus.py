@@ -20,7 +20,6 @@ from functools import reduce
 
 from mmengine.evaluator import BaseMetric
 from mmengine.logging import MMLogger
-from mmdet3d.evaluation import seg_eval
 from mmengine.registry import METRICS
 
 np.seterr(divide='ignore', invalid='ignore')

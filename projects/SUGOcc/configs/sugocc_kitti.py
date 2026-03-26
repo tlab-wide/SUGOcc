@@ -1,4 +1,4 @@
-#_base_ = ['../../../configs/_base_/default_runtime.py']
+_base_ = ['../../../configs/_base_/default_runtime.py']
 
 custom_imports = dict(imports=['projects.SUGOcc.sugocc'], allow_failed_imports=False)
 
@@ -57,7 +57,7 @@ mask2former_num_queries = 100
 mask2former_feat_channel = voxel_out_channels
 mask2former_output_channel = voxel_out_channels
 mask2former_pos_channel = mask2former_feat_channel / 3 # divided by ndim
-mask2former_num_heads = voxel_out_channels // 32
+mask2former_num_heads = 8
 
 model = dict(
     type='SUGOcc',
@@ -68,7 +68,7 @@ model = dict(
         num_outs=4,
         checkpoint_path='ckpts/maskdino_r50_50e_300q_panoptic_pq53.0.pth'),
     img_neck=dict(
-        type='mmdet3d.SECONDFPN',
+        type='SECONDFPN',
         in_channels=[256, 256, 256, 256, 256],
         upsample_strides=[0.25, 0.5, 1,2,4],
         out_channels=[128, 128, 128, 128, 128]),
@@ -85,6 +85,8 @@ model = dict(
         vp_megvii=False,
         lss_downsample=lss_downsample,
         grid_size=lss_occ_size,
+        seg_pruning_ratio=0.5,
+        depth_pruning_ratio=0.5,
     ),
     img_bev_encoder_backbone=dict(
         type='MinkowskiUNetEncoder',
@@ -101,10 +103,10 @@ model = dict(
         nclasses=num_class,
         in_channels=voxel_channels,
         out_channels=voxel_channels,
-        process_block_num=2,
+        process_block_num=[2, 2, 2],
         process_kernel_size=3,
         process_cross_kernel=True,
-        pruning_ratio=[0.1, 0.1, 0.1],
+        pruning_ratio=[0.5, 0.5, 0.5],
         lss_downsample=lss_downsample,
     ),
     pts_bbox_head=dict(
@@ -119,7 +121,7 @@ model = dict(
         cascade_ratio=2,
         fine_topk=30000,
         empty_idx=0,
-        dn_num=100,
+        dn_num=20,
         final_occ_size=occ_size,
         sample_from_voxel=True,
         sample_from_img=False,
@@ -139,7 +141,7 @@ model = dict(
                     type='MultiheadAttention',
                     embed_dims=mask2former_feat_channel,
                     num_heads=mask2former_num_heads,
-                    attn_drop=0.0,
+                    attn_drop=0.1,
                     proj_drop=0.0,
                     dropout_layer=None,
                     batch_first=False),
@@ -148,7 +150,7 @@ model = dict(
                     feedforward_channels=mask2former_feat_channel * 8,
                     num_fcs=2,
                     act_cfg=dict(type='ReLU', inplace=True),
-                    ffn_drop=0.0,
+                    ffn_drop=0.1,
                     dropout_layer=None,
                     add_identity=True),
                 feedforward_channels=mask2former_feat_channel * 8,
@@ -261,6 +263,7 @@ val_dataloader = dict(
     num_workers=8,
     persistent_workers=True,
     drop_last=False,
+    pin_memory=True,
     sampler=dict(type='DefaultSampler', shuffle=False),
     dataset=dict(
         type=dataset_type,

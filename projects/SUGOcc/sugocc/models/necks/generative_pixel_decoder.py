@@ -16,7 +16,7 @@ from projects.SUGOcc.sugocc.models.backbones.mink import *
 import MinkowskiEngine as ME
 import MinkowskiEngine.MinkowskiFunctional as MF
 from projects.SUGOcc.sugocc.utils.semkitti import semantic_kitti_class_frequencies
-from projects.SUGOcc.sugocc.utils.nusc import nusc_class_frequencies
+from projects.SUGOcc.sugocc.utils.nusc import nusc_class_frequencies, nusc_class_frequencies_womask
 from projects.SUGOcc.sugocc.utils.semkitti import geo_scal_loss, sem_scal_loss, CE_ssc_loss
 from projects.SUGOcc.sugocc.utils.lovasz_softmax import lovasz_softmax
 
@@ -30,12 +30,14 @@ class MinkowskiUpAndPruneBlock(BaseModule):
                  process_cross_kernel=False,
                  nclasses=20,
                  empty_idx=0,
+                 voxel_range=[200, 200, 16],
                  init_cfg=None):
         super().__init__(init_cfg=init_cfg)
         self.in_channels = in_channels
         self.out_channels = out_channels
         self.pruning_ratio = pruning_ratio
         self.empty_idx = empty_idx
+        self.voxel_range = voxel_range
         self.upsample_layers = nn.ModuleList()
         self.upsample_layers.append(
             nn.Sequential(
@@ -61,7 +63,9 @@ class MinkowskiUpAndPruneBlock(BaseModule):
         
         self.process = nn.Sequential(
             *[ResidualBlock(out_channels, out_channels, 
-                        ks=process_kernel_size, drop_path=0.2, cross_kernel=process_cross_kernel) for _ in range(process_block_num)]
+                        ks=process_kernel_size, drop_path=0.2, 
+                        cross_kernel=process_cross_kernel, 
+                        voxel_range=self.voxel_range) for _ in range(process_block_num)]
         )
         self.pruning = ME.MinkowskiPruning()
 
@@ -103,6 +107,8 @@ class SparseGenerativePixelDecoder(BaseModule):
                  pruning_ratio=[0.5, 0.5, 0.5],
                  empty_idx=0,
                  lss_downsample=[2,2,2],
+                 voxel_range=[200, 200, 16],
+                 wo_mask=False,
                  dataset='semantickitti',
                  init_cfg=None):
         super().__init__(init_cfg)
@@ -111,6 +117,8 @@ class SparseGenerativePixelDecoder(BaseModule):
         self.out_channels = out_channels
         self.empty_idx = empty_idx
         self.lss_downsample = lss_downsample
+        self.voxel_range = voxel_range
+        self.wo_mask = wo_mask
         self.upsample_blocks = nn.ModuleList()
         for i, in_channel in enumerate(self.in_channels):
             if i == len(self.in_channels) - 1:
@@ -119,11 +127,12 @@ class SparseGenerativePixelDecoder(BaseModule):
                 in_channels=self.in_channels[len(self.in_channels)-1-i],
                 out_channels=self.in_channels[len(self.in_channels)-2-i],
                 pruning_ratio=pruning_ratio[i],
-                process_block_num=process_block_num,
+                process_block_num=process_block_num[i],
                 process_kernel_size=process_kernel_size,
                 process_cross_kernel=process_cross_kernel,
                 empty_idx = self.empty_idx,
                 nclasses = nclasses,
+                voxel_range=self.voxel_range,
             )
             self.upsample_blocks.append(up_layer)
 
@@ -143,35 +152,38 @@ class SparseGenerativePixelDecoder(BaseModule):
                     )
                 )
             else:
-                self.out_convs.append(None)
-
+                self.out_convs.append(nn.Identity())
+        self.cls_layer = ME.MinkowskiConvolution(
+            in_channels=out_channels[-1],
+            out_channels=nclasses,
+            kernel_size=1,
+            stride=1,
+            bias=True,
+            dimension=3,)
         if dataset == 'semantickitti':
-            kitti_class_weights = 1 / np.log(semantic_kitti_class_frequencies)
-            norm_kitti_class_weights = kitti_class_weights / kitti_class_weights[0]
-            norm_kitti_class_weights = norm_kitti_class_weights.tolist()
-            norm_kitti_class_weights.append(0.1)
-            self.class_weight = norm_kitti_class_weights
+            class_frequencies = semantic_kitti_class_frequencies
         elif dataset == 'nuscenes':
-            nuscenes_class_weights = 1 / np.log(nusc_class_frequencies)
-            norm_nuscenes_class_weights = nuscenes_class_weights / nuscenes_class_weights[0]
-            norm_nuscenes_class_weights = norm_nuscenes_class_weights.tolist()
-            norm_nuscenes_class_weights.append(0.1)
-            self.class_weight = norm_nuscenes_class_weights
+            class_frequencies = nusc_class_frequencies_womask if self.wo_mask else nusc_class_frequencies
         else:
-            self.class_weight = [1.0] * nclasses + [0.1]
+            class_frequencies = [1.0 for _ in range(nclasses)]
+
+        kitti_class_weights = 1 / np.log(class_frequencies)
+        norm_kitti_class_weights = kitti_class_weights / kitti_class_weights[0]
+        norm_kitti_class_weights = norm_kitti_class_weights.tolist()
+        norm_kitti_class_weights.append(0.1)
+        self.class_weight = norm_kitti_class_weights
 
     def forward(self, x):
         prune_loss = []
         current_feat = x[-1]
-        outputs = [self.out_convs[-1](current_feat) if self.out_convs[-1] else current_feat]
+        outputs = [self.out_convs[-1](current_feat)]
         final_outs = [outputs[0]]
-        seg_logits = []
+        seg_logits = [self.cls_layer(outputs[0])]
         for i, up_layer in enumerate(self.upsample_blocks):
+            _s = time.time()
             current_feat, prune_loss_i, seg_i = up_layer(current_feat, short_cut=x[len(x)-2-i])
-            if self.out_convs[len(self.out_convs)-2-i]:
-                out = self.out_convs[len(self.out_convs)-2-i](current_feat)
-            else:
-                out = current_feat
+            
+            out = self.out_convs[len(self.out_convs)-2-i](current_feat)
             final_outs.insert(0, out)
             prune_loss.append(prune_loss_i)
             seg_logits.insert(0, seg_i)
@@ -197,7 +209,7 @@ class SparseGenerativePixelDecoder(BaseModule):
             pruning_loss += geo_scal_loss(logits.F,
                                         valid.long(),
                                         ignore_index=255,
-                                        non_empty_idx=self.empty_idx)
+                                        empty_idx=self.empty_idx)
             pruning_loss += lovasz_softmax(torch.softmax(logits.F, dim=1),
                                             valid.long(),
                                             ignore=255,)

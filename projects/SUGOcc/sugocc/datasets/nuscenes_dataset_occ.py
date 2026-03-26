@@ -7,21 +7,13 @@ import numpy as np
 from tqdm import tqdm
 from os import path as osp
 import os
-
-# from mmdet3d.datasets import DATASETS
-# from .nuscenes_dataset_bevdet import NuScenesDatasetBEVDet as NuScenesDataset
+import math
 import mmengine
 
-from mmdet3d.structures.points import lidar_points
-from .ego_pose_dataset import EgoPoseDataset
-from torch.utils.data import DataLoader
 from mmengine.dataset import BaseDataset
 from mmengine.registry import DATASETS
-from mmdet3d.structures import Box3DMode, Coord3DMode, LiDARInstance3DBoxes
-from mmengine.dataset import Compose
+from mmdet3d.structures import LiDARInstance3DBoxes
 from mmdet3d.structures import get_box_type
-# from ..core.evaluation.ray_metrics import main as calc_rayiou
-# from ..core.evaluation.occ_metrics import Metric_mIoU, Metric_FScore
 
 colors_map = np.array(
     [
@@ -162,6 +154,8 @@ class CustomNuScenesDatasetOccupancy(BaseDataset):
         self.multi_adj_frame_id_cfg = multi_adj_frame_id_cfg
         self.ego_cam = ego_cam
         self.stereo = stereo
+        # self.sequences_split_num = 1
+        # self._set_sequence_group_flag() 
 
     def get_cat_ids(self, idx):
         info = self.data_list[idx]
@@ -184,6 +178,41 @@ class CustomNuScenesDatasetOccupancy(BaseDataset):
         self.metadata = data['metadata']
         self.version = self.metadata['version']
         return data_list
+
+    def _set_sequence_group_flag(self):
+        """
+        Set each sequence to be a different group
+        """
+            
+        res = []
+        curr_sequence = 0
+        for idx in range(len(self.data_list)):
+            if idx != 0 and self.data_list[idx]['scene_name'] !=self.data_list[idx-1]['scene_name']:
+                # Not first frame and # of sweeps is 0 -> new sequence
+                curr_sequence += 1
+            res.append(curr_sequence)
+
+        self.flag = np.array(res, dtype=np.int64)
+
+        if self.sequences_split_num != 1:
+            if self.sequences_split_num == 'all':
+                self.flag = np.array(range(len(self.data_list)), dtype=np.int64)
+            else:
+                bin_counts = np.bincount(self.flag)
+                new_flags = []
+                curr_new_flag = 0
+                for curr_flag in range(len(bin_counts)):
+                    
+                    curr_sequence_length = np.array(
+                        list(range(0, bin_counts[curr_flag],math.ceil(bin_counts[curr_flag] / self.sequences_split_num)))
+                        + [bin_counts[curr_flag]])
+                    for sub_seq_idx in (curr_sequence_length[1:] - curr_sequence_length[:-1]):
+                        for _ in range(sub_seq_idx):
+                            new_flags.append(curr_new_flag)
+                        curr_new_flag += 1
+
+                assert len(new_flags) == len(self.flag)
+                self.flag = np.array(new_flags, dtype=np.int64)
 
     def prepare_test_data(self, index):
         """
@@ -213,7 +242,6 @@ class CustomNuScenesDatasetOccupancy(BaseDataset):
         Returns:
             dict: Training data dict of the corresponding index.
         """
-        # print(index)
         input_dict = self.get_data_info(index)
         if input_dict is None:
             print('found None in training data')
@@ -230,15 +258,14 @@ class CustomNuScenesDatasetOccupancy(BaseDataset):
         if isinstance(idx, dict):
             aug_config = idx["aug_config"]
             idx = idx["idx"]
-        # print(self.flag[idx], idx)
         if self.test_mode:
             return self.prepare_test_data(idx)
         while True:
             data = self.prepare_train_data(idx)
             if data is None:
+                print(f'found None in training data, re-sampling a new one')
                 idx = self._rand_another(idx)
                 continue
-
             return data
         
     def get_data_info(self, index):
@@ -291,6 +318,7 @@ class CustomNuScenesDatasetOccupancy(BaseDataset):
                     input_dict.update(dict(adjacent=info_adj_list))
         if self.test_mode:
             input_dict['eval_ann_info'] = dict()
+            input_dict['eval_ann_info']['occ_gt_path'] = self.data_list[index]['occ_path']
         input_dict['occ_gt_path'] = self.data_list[index]['occ_path']
         return input_dict
 

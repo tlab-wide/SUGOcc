@@ -58,8 +58,6 @@ class ModelEMA:
         module = model.module.module if is_parallel(model.module) else model.module
         for k, v in state_dict.items():
             self.ema_state[k] = v.detach().clone()
-            # if v.dtype.is_floating_point:
-            #     self.ema_state[k] = v.detach().clone()
 
     def update(self, trainer, model):
         # Update EMA parameters

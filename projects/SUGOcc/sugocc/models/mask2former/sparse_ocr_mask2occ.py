@@ -1,5 +1,6 @@
 # Copyright (c) OpenMMLab. All rights reserved.
 from encodings.punycode import decode_generalized_number
+from cv2 import norm
 from matplotlib.pyplot import cla
 import numpy as np
 import torch
@@ -32,7 +33,7 @@ from .base.mmdet_utils import (sample_valid_coords_with_frequencies,
 from .base.anchor_free_head import AnchorFreeHead
 from .base.maskformer_head import MaskFormerHead
 from projects.SUGOcc.sugocc.utils.semkitti import semantic_kitti_class_frequencies
-from projects.SUGOcc.sugocc.utils.nusc import nusc_class_frequencies
+from projects.SUGOcc.sugocc.utils.nusc import nusc_class_frequencies, nusc_class_frequencies_womask
 from projects.SUGOcc.sugocc.utils.semkitti import geo_scal_loss, sem_scal_loss, CE_ssc_loss
 from projects.SUGOcc.sugocc.utils.lovasz_softmax import lovasz_softmax
 from einops import rearrange
@@ -93,11 +94,13 @@ class SparseOCRMask2OccHead(MaskFormerHead):
                  positional_encoding=None,
                  pooling_attn_mask=True,
                  sample_weight_gamma=0.25,
+                 wo_mask=False,
                  dn_num=100,
                  noise_scale=0.4,
                  empty_idx=0,
                  with_cp=False,
                  align_corners=True,
+                 wo_assigner=False,
                  loss_cls=None,
                  loss_mask=None,
                  loss_dice=None,
@@ -120,6 +123,8 @@ class SparseOCRMask2OccHead(MaskFormerHead):
         self.lss_downsample = lss_downsample
         self.dataset = dataset
         self.empty_idx = empty_idx
+        self.wo_assigner = wo_assigner
+        self.wo_mask = wo_mask
         ''' Transformer Decoder Related '''
         # number of multi-scale features for masked attention
         self.num_transformer_feat_level = num_transformer_feat_level
@@ -142,10 +147,10 @@ class SparseOCRMask2OccHead(MaskFormerHead):
                 self.decoder_input_projs.append(nn.Identity())
                 
         self.decoder_positional_encoding = MODELS.build(positional_encoding)
-        self.query_embed = nn.Embedding(self.num_queries, feat_channels)
+        # self.query_embed = nn.Embedding(self.num_queries, feat_channels)
         self.query_feat = nn.Embedding(self.num_queries, feat_channels)
         self.global_prototypes = nn.Embedding(self.num_classes, feat_channels)
-        self.label_enc = nn.Embedding(self.num_classes, feat_channels)
+        self.label_enc = nn.Embedding(self.num_classes+1, feat_channels)
         self.global_initialized = torch.zeros(self.num_classes).cuda().bool()
         # from low resolution to high resolution
         # self.level_embed = nn.Embedding(self.num_transformer_feat_level, feat_channels)
@@ -172,16 +177,16 @@ class SparseOCRMask2OccHead(MaskFormerHead):
         if self.dataset == 'semantickitti':
             class_frequencies = semantic_kitti_class_frequencies
         elif self.dataset == 'nuscenes':
-            class_frequencies = nusc_class_frequencies
+            class_frequencies = nusc_class_frequencies_womask if self.wo_mask else nusc_class_frequencies
+            # class_frequencies = [1.0 for _ in range(self.num_occupancy_classes)]
         else:
             class_frequencies = [1.0 for _ in range(self.num_occupancy_classes)]
             # normalize the class weights based on semantic kitti class frequencies
         class_weights = 1 / np.log(class_frequencies)
-        norm_class_weights = class_weights / class_weights[self.empty_idx]
+        norm_class_weights = class_weights / class_weights[0]
         norm_class_weights = norm_class_weights.tolist()
         # append the class_weight for background
         norm_class_weights.append(self.class_weight[-1])
-        # print("********************12313******", self.class_weight[-1])
         self.class_weight = norm_class_weights
         loss_cls.class_weight = self.class_weight
         sample_weights = 1 / class_frequencies
@@ -202,14 +207,14 @@ class SparseOCRMask2OccHead(MaskFormerHead):
         self.final_occ_size = final_occ_size
 
         self.input_proj = nn.ModuleList()
-        for _ in range(self.num_transformer_feat_level):
-            if feat_channels != img_feat_channels:
-                self.input_proj.append(
-                    ConvModule(
-                        img_feat_channels, feat_channels, kernel_size=1, act_cfg=None))
-                weight_init.c2_xavier_fill(self.input_proj[-1].conv)
-            else:
-                self.input_proj.append(nn.Sequential())
+        # for _ in range(self.num_transformer_feat_level):
+        #     if feat_channels != img_feat_channels:
+        #         self.input_proj.append(
+        #             ConvModule(
+        #                 img_feat_channels, feat_channels, kernel_size=1, act_cfg=None))
+        #         weight_init.c2_xavier_fill(self.input_proj[-1].conv)
+        #     else:
+        #         self.input_proj.append(nn.Sequential())
 
         self.coarse_occ_pred = nn.ModuleList()
         self.refine_attns = nn.ModuleList()
@@ -217,7 +222,6 @@ class SparseOCRMask2OccHead(MaskFormerHead):
         for i in range(self.num_transformer_decoder_layers):
             self.coarse_occ_pred.append(nn.Sequential(
                 Conv3d(feat_channels, feat_channels//2, kernel_size=1, stride=1, padding=0),
-                # nn.GroupNorm(16, feat_channels//2),
                 build_norm_layer(norm_cfg, feat_channels//2)[1],
                 nn.ReLU(inplace=True),
                 Conv3d(feat_channels//2, num_occupancy_classes, kernel_size=1, stride=1, padding=0)
@@ -359,7 +363,102 @@ class SparseOCRMask2OccHead(MaskFormerHead):
         mask_targets = gt_masks[sampling_result.pos_assigned_gt_inds]
         mask_weights = mask_pred.new_zeros((num_queries, ))
         mask_weights[pos_inds] = class_weights_tensor[labels[pos_inds]]
-        # print(mask_weights.shape)
+
+        return (labels, label_weights, mask_targets, mask_weights, pos_inds, neg_inds)
+    
+    def get_targets_wo_assigner(self, cls_scores_list, mask_preds_list, gt_labels_list,
+                    gt_masks_list, img_metas):
+        """Compute classification and mask targets for all images for a decoder
+        layer.
+
+        Args:
+            cls_scores_list (list[Tensor]): Mask score logits from a single
+                decoder layer for all images. Each with shape (num_queries,
+                cls_out_channels).
+            mask_preds_list (list[Tensor]): Mask logits from a single decoder
+                layer for all images. Each with shape (num_queries, h, w).
+            gt_labels_list (list[Tensor]): Ground truth class indices for all
+                images. Each with shape (n, ), n is the sum of number of stuff
+                type and number of instance in a image.
+            gt_masks_list (list[Tensor]): Ground truth mask for each image,
+                each with shape (n, h, w).
+            img_metas (list[dict]): List of image meta information.
+
+        Returns:
+            tuple[list[Tensor]]: a tuple containing the following targets.
+                - labels_list (list[Tensor]): Labels of all images.\
+                    Each with shape (num_queries, ).
+                - label_weights_list (list[Tensor]): Label weights\
+                    of all images. Each with shape (num_queries, ).
+                - mask_targets_list (list[Tensor]): Mask targets of\
+                    all images. Each with shape (num_queries, h, w).
+                - mask_weights_list (list[Tensor]): Mask weights of\
+                    all images. Each with shape (num_queries, ).
+                - num_total_pos (int): Number of positive samples in\
+                    all images.
+                - num_total_neg (int): Number of negative samples in\
+                    all images.
+        """
+        (labels_list, label_weights_list, mask_targets_list, mask_weights_list,
+         pos_inds_list,
+         neg_inds_list) = multi_apply(self._get_target_single_wo_assigner, cls_scores_list,
+                                      mask_preds_list, gt_labels_list,
+                                      gt_masks_list, img_metas,)
+
+        num_total_pos = sum((inds.numel() for inds in pos_inds_list))
+        num_total_neg = sum((inds.numel() for inds in neg_inds_list))
+        return (labels_list, label_weights_list, mask_targets_list,
+                mask_weights_list, num_total_pos, num_total_neg)
+
+    def _get_target_single_wo_assigner(self, cls_score, mask_pred, gt_labels, gt_masks, img_metas):
+        """Compute classification and mask targets for one image.
+
+        Args:
+            cls_score (Tensor): Mask score logits from a single decoder layer
+                for one image. Shape (num_queries, cls_out_channels).
+            mask_pred (Tensor): Mask logits for a single decoder layer for one
+                image. Shape (num_queries, x, y, z).
+            gt_labels (Tensor): Ground truth class indices for one image with
+                shape (num_gts, ).
+            gt_masks (Tensor): Ground truth mask for each image, each with
+                shape (num_gts, x, y, z).
+            img_metas (dict): Image informtation.
+
+        Returns:
+            tuple[Tensor]: A tuple containing the following for one image.
+
+                - labels (Tensor): Labels of each image. \
+                    shape (num_queries, ).
+                - label_weights (Tensor): Label weights of each image. \
+                    shape (num_queries, ).
+                - mask_targets (Tensor): Mask targets of each image. \
+                    shape (num_queries, h, w).
+                - mask_weights (Tensor): Mask weights of each image. \
+                    shape (num_queries, ).
+                - pos_inds (Tensor): Sampled positive indices for each \
+                    image.
+                - neg_inds (Tensor): Sampled negative indices for each \
+                    image.
+        """
+        # sample points
+        num_queries = cls_score.shape[0]
+        num_gts = gt_labels.shape[0]
+        gt_labels = gt_labels.long()
+        
+        # label target
+        labels = gt_labels.new_full((self.num_classes, ), self.num_classes, dtype=torch.long)
+        labels[gt_labels] = gt_labels
+        labels = labels.repeat(num_queries // self.num_classes)
+        label_weights = labels.new_ones(num_queries).type_as(cls_score)
+        class_weights_tensor = torch.tensor(self.class_weight).type_as(cls_score)
+        
+        pos_inds = torch.where(labels != float(self.num_classes))[0]
+        neg_inds = torch.where(labels == float(self.num_classes))[0]
+        # mask target
+        mask_targets = gt_masks
+        mask_weights = mask_pred.new_zeros((num_queries, ))
+        mask_weights[pos_inds] = class_weights_tensor[labels[pos_inds]]
+        
         return (labels, label_weights, mask_targets, mask_weights, pos_inds, neg_inds)
     
     # @force_fp32(apply_to=('all_cls_scores', 'all_mask_preds'))
@@ -454,7 +553,7 @@ class SparseOCRMask2OccHead(MaskFormerHead):
         labels = labels.flatten(0, 1)
         label_weights = label_weights.flatten(0, 1)
         class_weight = cls_scores.new_tensor(self.class_weight)
-
+        
         loss_cls = self.loss_cls(
             cls_scores,
             labels,
@@ -512,6 +611,153 @@ class SparseOCRMask2OccHead(MaskFormerHead):
 
         return loss_cls, loss_mask, loss_dice
 
+    def loss_wo_assigner(self, all_cls_scores, all_mask_preds, gt_labels_list,
+                gt_masks_list, img_metas, **kwargs):
+        """Loss function.
+
+        Args:
+            all_cls_scores (Tensor): Classification scores for all decoder
+                layers with shape (num_decoder, batch_size, num_queries,
+                cls_out_channels). Note `cls_out_channels` should includes
+                background.
+            all_mask_preds (Tensor): Mask scores for all decoder layers with
+                shape (num_decoder, batch_size, num_queries, h, w).
+            gt_labels_list (list[Tensor]): Ground truth class indices for each
+                image with shape (n, ). n is the sum of number of stuff type
+                and number of instance in a image.
+            gt_masks_list (list[Tensor]): Ground truth mask for each image with
+                shape (n, h, w).
+            img_metas (list[dict]): List of image meta information.
+
+        Returns:
+            dict[str, Tensor]: A dictionary of loss components.
+        """
+        num_dec_layers = len(all_cls_scores)
+        all_gt_labels_list = [gt_labels_list for _ in range(num_dec_layers)]
+        all_gt_masks_list = [gt_masks_list for _ in range(num_dec_layers)]
+        img_metas_list = [img_metas for _ in range(num_dec_layers)]
+        
+        losses_cls, losses_mask, losses_dice = multi_apply(
+            self.loss_single_wo_assigner, all_cls_scores, all_mask_preds,
+            all_gt_labels_list, all_gt_masks_list, img_metas_list)
+        
+        loss_dict = dict()
+        # loss from the last decoder layer
+        loss_dict['loss_cls'] = losses_cls[-1]
+        loss_dict['loss_mask'] = losses_mask[-1]
+        loss_dict['loss_dice'] = losses_dice[-1]
+        
+        # loss from other decoder layers
+        num_dec_layer = 0
+        for loss_cls_i, loss_mask_i, loss_dice_i in zip(
+                losses_cls[:-1], losses_mask[:-1], losses_dice[:-1]):
+            loss_dict[f'd{num_dec_layer}.loss_cls'] = loss_cls_i
+            loss_dict[f'd{num_dec_layer}.loss_mask'] = loss_mask_i
+            loss_dict[f'd{num_dec_layer}.loss_dice'] = loss_dice_i
+            num_dec_layer += 1
+        
+        return loss_dict
+
+    def loss_single_wo_assigner(self, cls_scores, mask_preds, gt_labels_list,
+                    gt_masks_list, img_metas, **kwargs):
+        """Loss function for outputs from a single decoder layer.
+
+        Args:
+            cls_scores (Tensor): Mask score logits from a single decoder layer
+                for all images. Shape (batch_size, num_queries,
+                cls_out_channels). Note `cls_out_channels` should includes
+                background.
+            mask_preds (Tensor): Mask logits for a pixel decoder for all
+                images. Shape (batch_size, num_queries, x, y, z).
+            gt_labels_list (list[Tensor]): Ground truth class indices for each
+                image, each with shape (num_gts, ).
+            gt_masks_list (list[Tensor]): Ground truth mask for each image,
+                each with shape (num_gts, x, y, z).
+            img_metas (list[dict]): List of image meta information.
+
+        Returns:
+            tuple[Tensor]: Loss components for outputs from a single \
+                decoder layer.
+        """
+        num_imgs = cls_scores.size(0)
+        cls_scores_list = [cls_scores[i] for i in range(num_imgs)]
+        mask_preds_list = [mask_preds[i] for i in range(num_imgs)]
+
+        (labels_list, label_weights_list, mask_targets_list, mask_weights_list,
+         num_total_pos,
+         num_total_neg) = self.get_targets_wo_assigner(cls_scores_list, mask_preds_list,
+                                gt_labels_list, gt_masks_list, img_metas)
+        
+        # shape (batch_size, num_queries)
+        labels = torch.stack(labels_list, dim=0)
+        # shape (batch_size, num_queries)
+        label_weights = torch.stack(label_weights_list, dim=0)
+        # shape (num_total_gts, h, w)
+        mask_targets = torch.cat(mask_targets_list, dim=0)
+        # shape (batch_size, num_queries)
+        mask_weights = torch.stack(mask_weights_list, dim=0)
+        # classfication loss
+        # shape (batch_size * num_queries, )
+        cls_scores = cls_scores.flatten(0, 1)
+        labels = labels.flatten(0, 1)
+        label_weights = label_weights.flatten(0, 1)
+        class_weight = cls_scores.new_tensor(self.class_weight)
+        loss_cls = self.loss_cls(
+            cls_scores,
+            labels,
+            label_weights,
+            avg_factor=class_weight[labels].sum(),
+        )
+        # extract positive ones
+        # shape (batch_size, num_queries, h, w) -> (num_total_gts, h, w)
+        mask_preds = mask_preds[mask_weights > 0]
+        mask_weights = mask_weights[mask_weights > 0]
+        if mask_targets.shape[0] == 0:
+            # zero match
+            loss_dice = mask_preds.sum()
+            loss_mask = mask_preds.sum()
+            return loss_cls, loss_mask, loss_dice
+
+        ''' 
+        randomly sample K points for supervision, which can largely improve the 
+        efficiency and preserve the performance. oversample_ratio = 3.0, importance_sample_ratio = 0.75
+        '''
+        with torch.no_grad():
+            point_indices, point_coords = get_uncertain_point_coords_3d_with_frequency(
+                mask_preds.unsqueeze(1), None, gt_labels_list, gt_masks_list, 
+                self.sample_weights, self.num_points, self.oversample_ratio, 
+                self.importance_sample_ratio)
+            
+            # shape (num_total_gts, h, w) -> (num_total_gts, num_points)
+            mask_point_targets = torch.gather(mask_targets.view(mask_targets.shape[0], -1), 
+                                        dim=1, index=point_indices)
+        
+        # shape (num_queries, h, w) -> (num_queries, num_points)
+        mask_point_preds = point_sample_3d(
+            mask_preds.unsqueeze(1), point_coords[..., [2, 1, 0]], align_corners=self.align_corners).squeeze(1)
+        
+        # dice loss
+        num_total_mask_weights = reduce_mean(mask_weights.sum())
+        loss_dice = self.loss_dice(mask_point_preds, mask_point_targets, 
+                        weight=mask_weights, avg_factor=num_total_mask_weights)
+
+        # mask loss
+        # shape (num_queries, num_points) -> (num_queries * num_points, )
+        mask_point_preds = mask_point_preds.reshape(-1)
+        # shape (num_total_gts, num_points) -> (num_total_gts * num_points, )
+        mask_point_targets = mask_point_targets.reshape(-1)
+        mask_point_weights = mask_weights.view(-1, 1).repeat(1, self.num_points)
+        mask_point_weights = mask_point_weights.reshape(-1)
+        
+        num_total_mask_point_weights = reduce_mean(mask_point_weights.sum())
+        loss_mask = self.loss_mask(
+            mask_point_preds,
+            mask_point_targets,
+            weight=mask_point_weights,
+            avg_factor=num_total_mask_point_weights)
+
+        return loss_cls, loss_mask, loss_dice
+    
     def forward_head(self, 
                      decoder_out, 
                      mask_feature, 
@@ -535,7 +781,6 @@ class SparseOCRMask2OccHead(MaskFormerHead):
             - attn_mask (Tensor): Attention mask in shape \
                 (batch_size * num_heads, num_queries, h, w).
         """
-        # print(decoder_out.shape, mask_feature.shape, attn_mask_target_size, coords.shape)
         decoder_out = self.transformer_decoder.post_norm(decoder_out)
         decoder_out = decoder_out.transpose(0, 1)
         # shape (batch_size, num_queries, c)
@@ -554,7 +799,6 @@ class SparseOCRMask2OccHead(MaskFormerHead):
         mask_3d = empty_pred.reshape(empty_pred.shape[0], -1, 1, 1, 1)
         mask_3d = torch.where(nonempty_mask.unsqueeze(1).repeat(1, mask_pred.shape[1], 1, 1, 1), mask_pred, mask_3d)
         
-        # print(mask_3d.shape)
         return cls_pred, mask_3d
 
     def preprocess_gt(self, gt_occ, img_metas):
@@ -628,7 +872,11 @@ class SparseOCRMask2OccHead(MaskFormerHead):
     
     def prepare_for_dn(self, targets, batch_size):
         scalar, noise_scale = self.dn_num, self.noise_scale
-        known = [(torch.ones_like(t)).cuda() for t in targets["labels"]]
+        fullfill_label = [ t.new_full((self.dn_num, ), self.num_classes, dtype=torch.long) for t in targets["labels"]]
+        for i in range(len(fullfill_label)):
+            fullfill_label[i][targets["labels"][i]] = targets["labels"][i]
+        known = [(torch.ones_like(t)).cuda() for t in fullfill_label]
+                       
         know_idx = [torch.nonzero(t) for t in known]
         known_num = [sum(k) for k in known]
         if max(known_num) > 0:
@@ -640,13 +888,14 @@ class SparseOCRMask2OccHead(MaskFormerHead):
             attn_mask = None
             mask_dict = None
             return input_query_label, attn_mask, mask_dict
+        
         unmask_label = torch.cat(known)
-        labels = torch.cat([t for t in targets['labels']])
+        labels = torch.cat([t for t in fullfill_label])
         batch_idx = torch.cat([
             torch.full_like(t.long(), i)
-            for i, t in enumerate(targets['labels'])
+            for i, t in enumerate(fullfill_label)
         ])
-
+        # print(labels)
         # known
         known_indice = torch.nonzero(unmask_label)
         known_indice = known_indice.view(-1)
@@ -670,6 +919,7 @@ class SparseOCRMask2OccHead(MaskFormerHead):
             known_labels_expaned.scatter_(0, chosen_indice, new_label)
         m = known_labels_expaned.long().to('cuda')
         input_label_embed = self.label_enc(m)
+
         single_pad = int(max(known_num))
         pad_size = int(single_pad * scalar)
 
@@ -768,11 +1018,9 @@ class SparseOCRMask2OccHead(MaskFormerHead):
             min_coordinate=torch.IntTensor([0, 0, 0]),
         )[0]  # B, C, W, H, D
         B, _, W, H, D = mask_features.shape
-        # multi_scale_memorys = voxel_feats[:0:-1]
         nonempty_mask = (mask_features.abs().sum(dim=1) > 0)  # B, W, H, 
 
         query_feat = self.query_feat.weight.unsqueeze(1).repeat((1, batch_size, 1))
-        # query_embed = self.query_embed.weight.unsqueeze(1).repeat((1, batch_size, 1))
         scale = self.num_queries//self.num_classes
         global_prototypes = self.global_prototypes.weight.unsqueeze(1).repeat((scale, batch_size, 1))
         query_feat = self.query_inprojs[0](query_feat + global_prototypes)
@@ -781,8 +1029,6 @@ class SparseOCRMask2OccHead(MaskFormerHead):
         if targets is not None and self.dn_num > 0:
             input_query_label, dn_attn_mask, mask_dict = self.prepare_for_dn(targets, batch_size)
             query_feat = torch.cat([input_query_label.transpose(0,1), query_feat], dim=0)
-            # dn_query
-            # query_embed = torch.cat([query_embed.clone()[:self.dn_num], query_embed], dim=0)
         else:
             input_query_label, dn_attn_mask, mask_dict = None, None, None
 
@@ -807,11 +1053,11 @@ class SparseOCRMask2OccHead(MaskFormerHead):
             if self.training:
                 with torch.no_grad():
                     nonempty_prototypes_mask = local_prototypes.mean(dim=0).sum(dim=-1) != 0  # K
-                    no_assign_flag = nonempty_prototypes_mask * self.global_initialized
+                    no_assign_flag = nonempty_prototypes_mask * ~self.global_initialized
                     if no_assign_flag.sum() != 0:
                         self.global_prototypes.weight[no_assign_flag] = local_prototypes.mean(dim=0)[no_assign_flag].detach()
-                        self.global_initialized[no_assign_flag] = False
-                    proto_assign_flag = self.global_initialized == False
+                        self.global_initialized[no_assign_flag] = True
+                    proto_assign_flag = self.global_initialized == True
                     assign_flag = proto_assign_flag * nonempty_prototypes_mask
                     if assign_flag.shape[0] != 0:
                         self.global_prototypes.weight[assign_flag] = self.global_prototypes.weight[assign_flag] * (1-0.01) + local_prototypes.mean(dim=0)[assign_flag].detach()*0.01
@@ -886,7 +1132,7 @@ class SparseOCRMask2OccHead(MaskFormerHead):
         gt_labels, gt_masks = self.preprocess_gt(
             gt_occ[self.lss_downsample[0]//2], 
             img_metas)
-        
+
         targets = {
             "labels": gt_labels,
             "masks": gt_masks,
@@ -899,7 +1145,11 @@ class SparseOCRMask2OccHead(MaskFormerHead):
         for i, coarse_occ in enumerate(coarse_occ):
             losses_voxel = self.loss_voxel(coarse_occ, gt_occ[self.lss_downsample[0]//2], f"coarse_{i}")
             loss_dict.update(losses_voxel)
-        losses = self.loss(all_cls_scores, all_mask_preds, gt_labels, 
+        if self.wo_assigner:
+            losses = self.loss_wo_assigner(all_cls_scores, all_mask_preds, gt_labels, 
+                           gt_masks, img_metas, sparse_mask=None)
+        else:
+            losses = self.loss(all_cls_scores, all_mask_preds, gt_labels, 
                            gt_masks, img_metas, sparse_mask=None)
         loss_dict.update(losses)
         
@@ -962,7 +1212,8 @@ class SparseOCRMask2OccHead(MaskFormerHead):
         class_weights_tensor = torch.tensor(self.class_weight[:-1]).type_as(output_voxels)
         loss_dict['loss_voxel_ce_{}'.format(tag)] = CE_ssc_loss(output_voxels, gt_occ, class_weights_tensor, ignore_index=255)
         loss_dict['loss_voxel_sem_scal_{}'.format(tag)] = sem_scal_loss(output_voxels, gt_occ, ignore_index=255)
-        loss_dict['loss_voxel_geo_scal_{}'.format(tag)] = geo_scal_loss(output_voxels, gt_occ, ignore_index=255, non_empty_idx=self.empty_idx)
+        loss_dict['loss_voxel_geo_scal_{}'.format(tag)] = geo_scal_loss(output_voxels, gt_occ, ignore_index=255, empty_idx=self.empty_idx)
         loss_dict['loss_voxel_lovasz_{}'.format(tag)] = lovasz_softmax(torch.softmax(output_voxels, dim=1), gt_occ, ignore=255)
 
         return loss_dict
+    

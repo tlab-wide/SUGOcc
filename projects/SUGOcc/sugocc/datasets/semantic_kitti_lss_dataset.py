@@ -4,7 +4,6 @@ import os
 
 from mmengine.registry import DATASETS
 from mmengine.dataset import BaseDataset
-# from mmdet3d.datasets import SemanticKITTIDataset
 
 @DATASETS.register_module()
 class CustomSemanticKITTILssDataset(BaseDataset):
@@ -37,7 +36,6 @@ class CustomSemanticKITTILssDataset(BaseDataset):
         self.keep_consistent_seq_aug = False
         self.sequences = self.splits[split]
         self.n_classes = 20
-        # self.data_infos = self.load_annotations(self.ann_file)
         super().__init__(
             ann_file=ann_file,
             data_root=data_root,
@@ -193,7 +191,6 @@ class CustomSemanticKITTILssDataset(BaseDataset):
         Returns:
             dict: Training data dict of the corresponding index.
         """
-        # print(index)
         input_dict = self.get_data_info(index)
         if input_dict is None:
             print('found None in training data')
@@ -210,7 +207,7 @@ class CustomSemanticKITTILssDataset(BaseDataset):
         if isinstance(idx, dict):
             aug_config = idx["aug_config"]
             idx = idx["idx"]
-        # print(self.flag[idx], idx)
+
         if self.test_mode:
             return self.prepare_test_data(idx)
         while True:
@@ -232,7 +229,6 @@ class CustomSemanticKITTILssDataset(BaseDataset):
 
     def get_data_info(self, index):
         info = self.data_list[index]
-        # print(info)
         '''
         sample info includes the following:
             "img_2_path": img_2_path,
@@ -272,7 +268,6 @@ class CustomSemanticKITTILssDataset(BaseDataset):
                 cam_intrinsic=cam_intrinsics,
                 lidar2cam=lidar2cam_rts,
             ))
-        # print(input_dict['lidar2img'])
         # gt_occ is None for test-set
         if self.test_mode:
             input_dict['eval_ann_info'] = dict()

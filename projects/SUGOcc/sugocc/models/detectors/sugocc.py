@@ -6,10 +6,7 @@ from mmdet3d.models import Base3DSegmentor
 from mmdet3d.structures import PointData
 from mmengine.registry import MODELS
 from mmdet3d.structures.det3d_data_sample import SampleList
-# from mmdet.models import DETECTORS
-# from mmcv.runner import force_fp32, auto_fp16
 from projects.SUGOcc.sugocc.utils import fast_hist_crop
-# from .bevdepth import BEVDepth
 
 import numpy as np
 import time
@@ -28,6 +25,7 @@ class SUGOcc(Base3DSegmentor):
                  loss_norm=False,
                  train_cfg=None,
                  test_cfg=None,
+                 dataset='semantickitti',
                  **kwargs):
         super().__init__(**kwargs)
         
@@ -36,6 +34,7 @@ class SUGOcc(Base3DSegmentor):
         self.loss_norm = loss_norm
         self.nonempty_num = 0
         self.sample_num = 0
+        self.dataset = dataset
         if img_neck is not None:
             self.img_neck = MODELS.build(img_neck)
         else:
@@ -67,10 +66,32 @@ class SUGOcc(Base3DSegmentor):
             pts_bbox_head.update(test_cfg=pts_test_cfg)
             self.pts_bbox_head = MODELS.build(pts_bbox_head)
 
-    def image_encoder(self, img):
+    def prepare_inputs(self, inputs):
+        # split the inputs into each frame
+        # assert len(inputs) == 7 # nusc:7, semantickitti:10
+        B, N, C, H, W = inputs[0].shape
+        imgs, sensor2egos, ego2globals, intrins, post_rots, post_trans, bda = \
+            inputs[:7]
+
+        sensor2egos = sensor2egos.view(B, N, 4, 4)
+        ego2globals = ego2globals.view(B, N, 4, 4)
+
+        # calculate the transformation from adj sensor to key ego
+        keyego2global = ego2globals[:, 0,  ...].unsqueeze(1)    # (B, 1, 4, 4)
+        global2keyego = torch.inverse(keyego2global.double())   # (B, 1, 4, 4)
+        sensor2keyegos = \
+            global2keyego @ ego2globals.double() @ sensor2egos.double()     # (B, N_views, 4, 4)
+
+        sensor2keyegos = sensor2keyegos.float()
+
+        return [imgs, sensor2keyegos, ego2globals, intrins,
+                post_rots, post_trans, bda]
+    
+    def image_encoder(self, img, stereo=False):
         imgs = img
         B, N, C, imH, imW = imgs.shape
         imgs = imgs.view(B * N, C, imH, imW)
+        stereo_feat=None
         _s = time.time()
         x = self.img_backbone(imgs)
         if isinstance(x, dict):
@@ -78,6 +99,9 @@ class SUGOcc(Base3DSegmentor):
             for i in range(len(img_feats)):
                 img_feats[i] = img_feats[i].contiguous()
         else:
+            if stereo:
+                stereo_feat = x[0]
+                x = x[1:]
             img_feats = x
 
         if self.img_neck is not None:
@@ -88,7 +112,7 @@ class SUGOcc(Base3DSegmentor):
         _, output_dim, ouput_H, output_W = fused_feats.shape
         fused_feats = fused_feats.view(B, N, output_dim, ouput_H, output_W)
         
-        return fused_feats
+        return fused_feats, stereo_feat
 
     def bev_encoder(self, x):
         voxel_seg_logits = []
@@ -116,12 +140,13 @@ class SUGOcc(Base3DSegmentor):
 
     def extract_img_feat(self, img):
         """Extract features of images."""
-        # print(len(img[0]))
+
         if self.record_time:
             torch.cuda.synchronize()
             t0 = time.time()
-                
-        x = self.image_encoder(img[0])
+        if self.dataset == 'nuscenes':
+            img = self.prepare_inputs(img)
+        x, _ = self.image_encoder(img[0], stereo=self.dataset == 'nuscenes')
         
         if self.record_time:
             torch.cuda.synchronize()
@@ -186,11 +211,12 @@ class SUGOcc(Base3DSegmentor):
         img_inputs = batch_inputs['img_inputs']
         for i in range(len(img_inputs)):
             img_inputs[i] = torch.stack(img_inputs[i], dim=0) 
-        gt_occ = []
-        for gt in batch_inputs['gt_occ']:
-            gt_occ.append(torch.stack(gt, dim=0)) 
+
         img_metas = [data_sample.metainfo for data_sample in batch_data_samples]
+
+
         outs = self.forward_test(img_metas=img_metas, img_inputs=img_inputs)
+
         return self.postprocess_result(outs, batch_data_samples)
 
     def aug_test(self, batch_inputs, batch_data_samples):
@@ -326,15 +352,16 @@ class SUGOcc(Base3DSegmentor):
     
 
     def simple_test(self, img_metas, img=None, rescale=False, points_occ=None, points_uv=None):
-
-        x = self.image_encoder(img[0])
+        if self.dataset == 'nuscenes':
+            img = self.prepare_inputs(img)
+        x, _ = self.image_encoder(img[0], stereo=self.dataset == 'nuscenes')
         
         # img: imgs, rots, trans, intrins, post_rots, post_trans, gt_depths, sensor2sensors
         rots, trans, intrins, post_rots, post_trans, bda = img[1:7]
         
         mlp_input = self.img_view_transformer.get_mlp_input(rots, trans, intrins, post_rots, post_trans, bda)
         geo_inputs = [rots, trans, intrins, post_rots, post_trans, bda, mlp_input]
-        x, _, _ = self.img_view_transformer([x] + geo_inputs)
+        x, _, _ = self.img_view_transformer([x] + geo_inputs, img_metas=img_metas)
         
         x, _ = self.bev_encoder(x)
         if type(x) is not list:

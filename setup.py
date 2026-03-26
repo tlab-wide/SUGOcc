@@ -47,7 +47,7 @@ if __name__ == '__main__':
         version='0.0',
         description=("Copy and Modified from OpenOccupancy: A Large Scale Benchmark for Surrounding Semantic Occupancy Perception"),
         author='OpenOccupancy Contributors',
-        author_email='hanlinwu@g.ecc.u-tokyo.ac.jp',
+        author_email='wangxiaofeng2020@ia.ac.cn',
         keywords='Occupancy Perception',
         packages=find_packages(),
         include_package_data=True,
@@ -63,6 +63,22 @@ if __name__ == '__main__':
         license="Apache License 2.0",
 
         ext_modules=[
+            make_cuda_ext(
+                name="bev_pool_v3_ext",
+                module="projects.SUGOcc.sugocc.ops.bev_pool_v3",
+                sources=[
+                    "src/bev_pool.cpp",
+                    "src/bev_pool_cuda.cu"
+                ],
+            ),
+            make_cuda_ext(
+                name="bev_pool_v2_ext",
+                module="projects.SUGOcc.sugocc.ops.bev_pool_v2",
+                sources=[
+                    "src/bev_pool.cpp",
+                    "src/bev_pool_cuda.cu"
+                ],
+            ),
             make_cuda_ext(
                 name="occ_pool_ext",
                 module="projects.SUGOcc.sugocc.ops.occ_pooling",

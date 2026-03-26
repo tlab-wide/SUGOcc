@@ -2,14 +2,8 @@
 import math
 import torch
 import torch.nn as nn
-# from mmcv.runner import BaseModule
 from mmengine.model import BaseModule
-# from mmdet.models.builder import HEADS, build_loss
-# from mmdet3d.models.builder import NECKS
-# from mmdet3d.ops.bev_pool import bev_pool
-# from mmdet3d.ops.voxel_pooling import voxel_pooling
 from mmcv.cnn import build_conv_layer
-# from mmcv.runner import force_fp32, auto_fp16
 from torch.cuda.amp.autocast_mode import autocast
 from mmdet.models.backbones.resnet import BasicBlock
 import torch.nn.functional as F
@@ -17,7 +11,6 @@ from torch.utils.checkpoint import checkpoint
 from scipy.special import erf
 from scipy.stats import norm
 import numpy as np
-# from mmdet3d.models import builder
 import pdb
 from mmengine.registry import MODELS
 
@@ -344,35 +337,40 @@ class _ASPPModule(nn.Module):
 
 
 class ASPP(nn.Module):
-    def __init__(self, inplanes, mid_channels=256, BatchNorm=nn.BatchNorm2d):
+
+    def __init__(self, inplanes, mid_channels=256, BatchNorm=nn.BatchNorm2d, aspp_mid_channel=False):
         super(ASPP, self).__init__()
 
         dilations = [1, 6, 12, 18]
 
-        self.aspp1 = _ASPPModule(inplanes,
-                                 mid_channels,
-                                 1,
-                                 padding=0,
-                                 dilation=dilations[0],
-                                 BatchNorm=BatchNorm)
-        self.aspp2 = _ASPPModule(inplanes,
-                                 mid_channels,
-                                 3,
-                                 padding=dilations[1],
-                                 dilation=dilations[1],
-                                 BatchNorm=BatchNorm)
-        self.aspp3 = _ASPPModule(inplanes,
-                                 mid_channels,
-                                 3,
-                                 padding=dilations[2],
-                                 dilation=dilations[2],
-                                 BatchNorm=BatchNorm)
-        self.aspp4 = _ASPPModule(inplanes,
-                                 mid_channels,
-                                 3,
-                                 padding=dilations[3],
-                                 dilation=dilations[3],
-                                 BatchNorm=BatchNorm)
+        self.aspp1 = _ASPPModule(
+            inplanes,
+            mid_channels,
+            1,
+            padding=0,
+            dilation=dilations[0],
+            BatchNorm=BatchNorm)
+        self.aspp2 = _ASPPModule(
+            inplanes,
+            mid_channels,
+            3,
+            padding=dilations[1],
+            dilation=dilations[1],
+            BatchNorm=BatchNorm)
+        self.aspp3 = _ASPPModule(
+            inplanes,
+            mid_channels,
+            3,
+            padding=dilations[2],
+            dilation=dilations[2],
+            BatchNorm=BatchNorm)
+        self.aspp4 = _ASPPModule(
+            inplanes,
+            mid_channels,
+            3,
+            padding=dilations[3],
+            dilation=dilations[3],
+            BatchNorm=BatchNorm)
 
         self.global_avg_pool = nn.Sequential(
             nn.AdaptiveAvgPool2d((1, 1)),
@@ -380,11 +378,14 @@ class ASPP(nn.Module):
             BatchNorm(mid_channels),
             nn.ReLU(),
         )
-        self.conv1 = nn.Conv2d(int(mid_channels * 5),
-                               mid_channels,
-                               1,
-                               bias=False)
-        self.bn1 = BatchNorm(mid_channels)
+        if aspp_mid_channel:
+            out_ch = inplanes
+        else:
+            out_ch = mid_channels
+            
+        self.conv1 = nn.Conv2d(
+            int(mid_channels * 5), out_ch, 1, bias=False)
+        self.bn1 = BatchNorm(out_ch)
         self.relu = nn.ReLU()
         self.dropout = nn.Dropout(0.5)
         self._init_weight()
@@ -395,10 +396,8 @@ class ASPP(nn.Module):
         x3 = self.aspp3(x)
         x4 = self.aspp4(x)
         x5 = self.global_avg_pool(x)
-        x5 = F.interpolate(x5,
-                           size=x4.size()[2:],
-                           mode='bilinear',
-                           align_corners=True)
+        x5 = F.interpolate(
+            x5, size=x4.size()[2:], mode='bilinear', align_corners=True)
         x = torch.cat((x1, x2, x3, x4, x5), dim=1)
 
         x = self.conv1(x)

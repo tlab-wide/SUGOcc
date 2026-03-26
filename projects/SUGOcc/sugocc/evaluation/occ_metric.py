@@ -17,7 +17,7 @@ from torchmetrics.metric import Metric
 
 from mmengine.evaluator import BaseMetric
 from mmengine.logging import MMLogger
-from mmdet3d.evaluation import seg_eval
+# from mmdet3d.evaluation import seg_eval
 from mmengine.registry import METRICS
 
 LABEL2CAT = {
@@ -45,7 +45,6 @@ LABEL2CAT = {
 
 class SSCMetrics(Metric):
     def __init__(self, class_names=None, compute_on_step=False):
-        # super().__init__(compute_on_step=compute_on_step)
         super().__init__()
         
         if class_names is None:

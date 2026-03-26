@@ -1,15 +1,17 @@
 # Copyright (c) Phigent Robotics. All rights reserved.
+from calendar import c
+import dis
 import torch
 import time
-# from mmdet3d.models.builder import NECKS
-# from mmdet3d.ops.bev_pool import bev_pool
+import os
+import torch.utils.checkpoint as cp
 from projects.SUGOcc.sugocc.ops.occ_pooling import occ_pool, occ_avg_pool
+from projects.SUGOcc.sugocc.ops.bev_pool_v2 import bev_pool_v2
+from projects.SUGOcc.sugocc.ops.bev_pool_v3 import bev_pool_v3
 from projects.SUGOcc.sugocc.utils.semkitti import geo_scal_loss, sem_scal_loss, CE_ssc_loss, multiscale_supervision
-# from mmcv.runner import force_fp32
 from torch.cuda.amp.autocast_mode import autocast
 import torch.nn.functional as F
 import pdb
-# from mmdet3d.models import builder
 from .ViewTransformerLSSBEVDepth import *
 from mmengine.registry import MODELS
 import MinkowskiEngine as ME
@@ -18,20 +20,20 @@ import math
 
 class DepthDistanceSineEncoding(torch.nn.Module):
     """
-    基于到前景深度 d* 的距离的一维正弦/余弦编码（沿 D 维）。
-    输入:
-        prob: [B, D, H, W]  深度概率(无需归一化)
-        mask: [B, H, W] 或 None。非零为忽略位置，零为有效位置（与你给的代码一致）。
-              若提供，将对无效像素把距离置零，并额外输出一个valid通道可选。
-    参数:
-        num_feats: 每个正弦或余弦一侧的通道数；总输出通道 = 2 * num_feats
-        temperature: 频率温度，参考 DETR/Transformer
-        normalize: 是否把距离缩放到 [0, scale]
-        scale: 与 normalize 搭配；常用 2π
-        distance_unit: 把索引差转换到真实尺度（如每层=0.1米）
-        clamp_max: 可选距离上限，控制高频抖动
-        add_valid_channel: 是否在最后附加 1 个有效性通道（0/1），方便下游使用
-    输出:
+    1D sine/cosine positional encoding based on distance to the foreground depth d* (along the D dimension).
+    Inputs:
+        prob: [B, D, H, W]  depth probability (no normalization required)
+        mask: [B, H, W] or None. Non-zero indicates ignored positions, zero indicates valid positions.
+              If provided, distances at invalid pixels are zeroed out; an optional valid channel can be appended.
+    Args:
+        num_feats: number of channels per sine or cosine side; total output channels = 2 * num_feats
+        temperature: frequency temperature, following DETR/Transformer convention
+        normalize: whether to scale distances to [0, scale]
+        scale: used together with normalize; commonly set to 2π
+        distance_unit: converts index difference to real-world scale (e.g., 0.1m per bin)
+        clamp_max: optional upper bound on distance to suppress high-frequency jitter
+        add_valid_channel: whether to append 1 validity channel (0/1) at the end for downstream use
+    Outputs:
         pos: [B, 2*num_feats (+1 if add_valid_channel), D, H, W]
     """
     def __init__(self,
@@ -50,7 +52,7 @@ class DepthDistanceSineEncoding(torch.nn.Module):
         self.distance_unit = float(distance_unit)
         self.clamp_max = None if clamp_max is None else float(clamp_max)
         self.add_valid_channel = bool(add_valid_channel)
-        self.eps = 1e-6  # 防除零
+        self.eps = 1e-6  # avoid division by zero
 
         dim_t = torch.arange(self.num_feats, dtype=torch.float32)
         dim_t = self.temperature ** (2 * torch.div(dim_t, 2, rounding_mode='floor') / self.num_feats)
@@ -67,53 +69,170 @@ class DepthDistanceSineEncoding(torch.nn.Module):
         device = prob.device
         dtype = torch.float32
 
-        # 1) 前景深度索引 d* = argmax_d P
-        # keepdim=True 方便广播到 [B, D, H, W]
-        # 2) 计算距离 |d - d*|
+        # 1) foreground depth index d* = argmax_d P
+        # keepdim=True for broadcasting to [B, D, H, W]
+        # 2) compute distance |d - d*|
         d_index = torch.arange(D, device=device, dtype=dtype)  # [1, D, 1, 1]
-        _s = time.time()
+        # _s = time.time()
         d_star = torch.einsum('bdhw, d -> bhw', prob, d_index) # [B, H, W]
         dist = (d_index.view(1, D, 1, 1) - d_star.unsqueeze(1)) # [B, D, H, W]
 
-        # 3) 可选：按需求把索引差换算到真实尺度
+        # 3) optional: convert index difference to real-world scale
         if self.distance_unit != 1.0:
             dist = dist * self.distance_unit
 
-        # 4) 可选：归一化到 [0, scale]（与2D/3D正弦编码风格一致）
+        # 4) optional: normalize to [0, scale] (consistent with 2D/3D sine encoding style)
         if self.normalize:
-            # 最大可能距离：若以索引差计，则 ~ (D-1)
+            # maximum possible distance: ~(D-1) in index units
             max_dist = float(D - 1) * (self.distance_unit if self.distance_unit != 1.0 else 1.0)
             dist = dist / max(max_dist, self.eps) * self.scale
 
-        # 5) 可选：截断距离上限，数值更稳
+        # 5) optional: clamp distance upper bound for numerical stability
         if self.clamp_max is not None:
             dist = dist.clamp(max=self.clamp_max)
 
         pos = dist.unsqueeze(-1) / self.dim_t.view(1, 1, 1, 1, -1)  # [B, D, H, W, C]
-        # 7) 交替堆叠 sin/cos -> [B, D, H, W, 2C]，再转到 [B, 2C, D, H, W]
-        # 用 stack + view 保持 ONNX 友好（与你参考代码一致）
-        
+        # 7) interleave sin/cos -> [B, D, H, W, 2C], then permute to [B, 2C, D, H, W]
+        # use stack + view for ONNX compatibility
+
         pos = torch.stack((pos[..., 0::2].sin(), pos[..., 1::2].cos()), dim=5)
         pos = pos.view(B, D, H, W, -1)               # [B, D, H, W, 2*C]
         pos = pos.permute(0, 4, 1, 2, 3) # [B, 2*C, D, H, W]
-        
-        # 8) 可选：mask 处理（与参考代码一致：非零为忽略）
+
+        # 8) optional: mask handling (non-zero = ignored, consistent with reference)
         if mask is not None:
-            # 统一成 int，0=valid, 1=ignored
+            # cast to int, 0=valid, 1=ignored
             mask_i = mask.to(torch.int)
-            # 有时希望把无效像素的编码清零（避免干扰）
+            # zero out encodings at invalid pixels to avoid interference
             valid = (1 - mask_i).to(dtype)  # [B, H, W], 1=valid, 0=ignored
-            valid = valid.view(B, 1, 1, H, W)  # 便于广播到 [B, 2C, D, H, W]
+            valid = valid.view(B, 1, 1, H, W)  # broadcast to [B, 2C, D, H, W]
             pos = pos * valid
             if self.add_valid_channel:
-                pos = torch.cat([pos, valid], dim=1)  # 附加一个有效性通道
+                pos = torch.cat([pos, valid], dim=1)  # append validity channel
 
         return pos  # [B, 2*num_feats (+1), D, H, W]
 
 @MODELS.register_module()
+class CM_DepthNet(BaseModule):
+    """
+        Camera parameters aware depth net
+    """
+    def __init__(self,
+                 in_channels=512, #256
+                 context_channels=64, #numC_Trans
+                 depth_channels=118,
+                 mid_channels=512,
+                 use_dcn=True,
+                 downsample=16,
+                 grid_config=None,
+                 loss_depth_weight=3.0,
+                 with_cp=False,
+                 se_depth_map=False,
+                 sid=False,
+                 aspp_mid_channels=-1,         
+                 cam_channel=27,
+                 num_class=18, #nusc
+        ):
+        super(CM_DepthNet, self).__init__()
+        self.fp16_enable=False
+        self.sid=sid
+        self.with_cp = with_cp
+        self.downsample = downsample
+        self.grid_config = grid_config
+        self.loss_depth_weight = loss_depth_weight
+        self.reduce_conv = nn.Sequential(
+            nn.Conv2d(
+                in_channels, mid_channels, kernel_size=3, stride=1, padding=1),
+            nn.BatchNorm2d(mid_channels),
+            nn.ReLU(inplace=True),
+        )
+        self.context_channels = context_channels
+        self.depth_channels = depth_channels
+        self.se_depth_map = se_depth_map
+        self.context_conv = nn.Conv2d(
+            mid_channels, context_channels, kernel_size=1, stride=1, padding=0)
+        self.bn = nn.BatchNorm1d(cam_channel)
+        self.depth_mlp = Mlp(cam_channel, mid_channels, mid_channels)
+        self.depth_se = SELayer(mid_channels)  # NOTE: add camera-aware
+        self.context_mlp = Mlp(cam_channel, mid_channels, mid_channels)
+        self.context_se = SELayer(mid_channels)  # NOTE: add camera-aware
+        depth_conv_input_channels = mid_channels
+        downsample = None
+        self.num_class = num_class
+        depth_conv_list = [
+           BasicBlock(depth_conv_input_channels, mid_channels,
+                                      downsample=downsample),
+            BasicBlock(mid_channels, mid_channels),
+            BasicBlock(mid_channels, mid_channels),
+        ]
+        aspp_mid_channel = True
+        if aspp_mid_channels < 0:
+            aspp_mid_channels = mid_channels
+            aspp_mid_channel = False
+
+        depth_conv_list.append(ASPP(mid_channels, aspp_mid_channels, aspp_mid_channel=aspp_mid_channel))
+        if use_dcn:
+            depth_conv_list.append(
+                build_conv_layer(
+                    cfg=dict(
+                        type='DCN',
+                        in_channels=mid_channels,
+                        out_channels=mid_channels,
+                        kernel_size=3,
+                        padding=1,
+                        groups=4,
+                        im2col_step=128,
+                    )))
+        depth_conv_list.append(
+            nn.Conv2d(
+                mid_channels,
+                depth_channels,
+                kernel_size=1,
+                stride=1,
+                padding=0))
+        self.depth_conv = nn.Sequential(*depth_conv_list)
+        self.D =depth_channels
+        self.class_predictor = nn.Sequential(
+                nn.Conv2d(self.context_channels , self.context_channels * 2, kernel_size=3, stride=1, padding=1),
+                nn.BatchNorm2d(self.context_channels * 2),
+                nn.ReLU(),
+                nn.Conv2d(self.context_channels * 2, self.context_channels * 2, kernel_size=1, stride=1, padding=0),
+                nn.BatchNorm2d(self.context_channels * 2),
+                nn.ReLU(),
+                nn.Conv2d(self.context_channels * 2, self.num_class, kernel_size=1, stride=1, padding=0)
+                )
+
+    def forward(self, x, mlp_input):
+        x = x.to(torch.float32)
+        mlp_input = self.bn(mlp_input.reshape(-1, mlp_input.shape[-1])) 
+        # B * N, C, H, W = x.shape
+        # x = x.view(B * N, C, H, W) 
+        if self.with_cp and x.requires_grad:
+            x = cp.checkpoint(self.reduce_conv, x)
+        else:
+            x = self.reduce_conv(x) 
+        context_se = self.context_mlp(mlp_input)[..., None, None]
+        if self.with_cp and x.requires_grad:
+            context = cp.checkpoint(self.context_se, x, context_se)
+        else:
+            context = self.context_se(x, context_se) 
+        context = self.context_conv(context) 
+        depth_se = self.depth_mlp(mlp_input)[..., None, None] 
+        depth = self.depth_se(x, depth_se)
+
+
+        if self.with_cp and depth.requires_grad:
+            depth = cp.checkpoint(self.depth_conv, depth)
+        else:
+            depth = self.depth_conv(depth)
+
+        seg = self.class_predictor(context)
+        return torch.cat([depth, context], dim=1), seg
+
+@MODELS.register_module()
 class SegAndDepthNet(nn.Module):
     def __init__(self, in_channels, mid_channels, context_channels,
-                 depth_channels, cam_channels=27, num_classes=20):
+                 depth_channels, cam_channels=27, num_classes=20, **kwargs):
         super(SegAndDepthNet, self).__init__()
         self.reduce_conv = nn.Sequential(
             nn.Conv2d(in_channels,
@@ -140,7 +259,7 @@ class SegAndDepthNet(nn.Module):
             BasicBlock(mid_channels, mid_channels),
             BasicBlock(mid_channels, mid_channels),
             BasicBlock(mid_channels, mid_channels),
-            ASPP(mid_channels, mid_channels),
+            ASPP(mid_channels, mid_channels, aspp_mid_channel=True),
             build_conv_layer(cfg=dict(
                 type='DCN',
                 in_channels=mid_channels,
@@ -163,7 +282,7 @@ class SegAndDepthNet(nn.Module):
             BasicBlock(mid_channels, mid_channels),
             BasicBlock(mid_channels, mid_channels),
             BasicBlock(mid_channels, mid_channels),
-            ASPP(mid_channels, mid_channels),
+            ASPP(mid_channels, mid_channels, aspp_mid_channel=True),
             build_conv_layer(cfg=dict(
                 type='DCN',
                 in_channels=mid_channels,
@@ -210,6 +329,11 @@ class ViewTransformerLiftSplatShootVoxel(ViewTransformerLSSBEVDepth):
             lss_downsample=[2,2,2],
             empty_idx=0,
             num_classes=20,
+            num_cam=1,
+            seg_pruning_ratio=0.1,
+            depth_pruning_ratio=0.1,    
+            dataset='semantickitti',
+            depthnet_cfg=dict(),
             **kwargs,
         ):
         super(ViewTransformerLiftSplatShootVoxel, self).__init__(loss_depth_weight=loss_depth_weight, **kwargs)
@@ -218,21 +342,41 @@ class ViewTransformerLiftSplatShootVoxel(ViewTransformerLSSBEVDepth):
         self.lss_downsample = lss_downsample
         self.empty_idx = empty_idx
         self.num_classes = num_classes
+        self.dataset = dataset
+        self.num_cam = num_cam
         self.create_grid_infos(self.grid_config["xbound"],
                                self.grid_config["ybound"],
                                self.grid_config["zbound"])
-        depth_net = dict(
-            type="SegAndDepthNet",
-            in_channels=self.numC_input,
-            mid_channels=self.numC_input,
-            context_channels=self.numC_Trans,
-            depth_channels=self.D,
-            cam_channels=self.cam_channels,
-            num_classes=self.num_classes,
-        )
+        if self.dataset == 'semantickitti':
+            depth_net = dict(
+                type="SegAndDepthNet",
+                in_channels=self.numC_input,
+                mid_channels=self.numC_input,
+                context_channels=self.numC_Trans,
+                depth_channels=self.D,
+                cam_channels=self.cam_channels,
+                num_classes=self.num_classes,
+            )
+        else:
+            depth_net = dict(
+                type="CM_DepthNet",
+                in_channels=self.numC_input,
+                mid_channels=self.numC_input,
+                context_channels=self.numC_Trans,
+                depth_channels=self.D,
+                cam_channel=self.cam_channels,
+                num_class=self.num_classes,
+                **depthnet_cfg,
+            )
+
         self.depth_net = MODELS.build(depth_net)
-        self.opacity_embedding = DepthDistanceSineEncoding(self.numC_Trans)
+        self.opacity_embedding = DepthDistanceSineEncoding(self.numC_Trans//self.num_cam-(self.numC_Trans//self.num_cam)%2)
         self.criterion_seg = nn.CrossEntropyLoss(reduction='mean', ignore_index=255)
+        self.seg_pruning_ratio = seg_pruning_ratio
+        self.depth_pruning_ratio = depth_pruning_ratio
+        self.initial_flag = True
+        self.voxel_num = 0
+        self.test_num=0
     
     def create_grid_infos(self, x, y, z, **kwargs):
         """Generate the grid information including the lower bound, interval,
@@ -287,24 +431,64 @@ class ViewTransformerLiftSplatShootVoxel(ViewTransformerLSSBEVDepth):
         with autocast(enabled=False):
             depth_loss = F.binary_cross_entropy(depth_preds, depth_labels, reduction='none').sum() / max(1.0, fg_mask.sum())
         
-        return depth_loss
+        return self.loss_depth_weight *depth_loss
     
     def get_seg_loss(self, x, gt_occ, rots, trans, intrins, 
                      post_rots, post_trans, bda):
-        geom = self.get_geometry(
-            rots=rots, trans=trans, intrins=intrins, 
-            post_rots=post_rots, post_trans=post_trans, bda=bda)
+        
         BN, C, H, W = x.shape
-        projects_seg_gt = self.get_seg_gt_from_occ(geom, gt_occ[self.lss_downsample[0]//2])
-        labels = projects_seg_gt.clone().view(BN, -1, H, W)
-        index = (labels!=self.empty_idx).long().argmax(dim=1)
+        
+        if self.dataset == 'semantickitti':
+            geom = self.get_geometry(
+                rots=rots, trans=trans, intrins=intrins, 
+                post_rots=post_rots, post_trans=post_trans, bda=bda)
+            projects_seg_gt = self.get_seg_gt_from_occ(geom, gt_occ[self.lss_downsample[0]//2])
+            labels = projects_seg_gt.clone().view(BN, -1, H, W)
+            index = ((labels!=self.empty_idx)&(labels!=255)).long().argmax(dim=1)
+        elif self.dataset == 'nuscenes':
+            geom = self.get_ego_coor(
+                rots, trans, intrins, post_rots, post_trans, bda)
+            projects_seg_gt = self.get_seg_gt_from_occ(geom, gt_occ[self.lss_downsample[0]//2])
+            labels = projects_seg_gt.clone().view(BN, -1, H, W)
+            index = ((labels!=self.empty_idx)&(labels!=255)).long().argmax(dim=1)
         labels = torch.gather(labels, dim=1, index=index.unsqueeze(1)).squeeze(1)
+
         seg_loss = self.criterion_seg(
             x,
             labels.long()
         )
-        return seg_loss
+        return self.loss_depth_weight * seg_loss
 
+    def get_seg_gt_from_occ(self, geom_feats, gt_occ):
+        B, N, D, H, W, C = geom_feats.shape
+        Nprime = B * N * D * H * W
+        # flatten indices
+        geom_feats = ((geom_feats - self.grid_lower_bound.to(geom_feats.device)) / self.grid_interval.to(geom_feats.device)).long()
+        geom_feats = geom_feats.view(Nprime, 3)
+        batch_ix = torch.cat([torch.full([Nprime // B, 1], ix, device=geom_feats.device, dtype=torch.long) for ix in range(B)])
+        geom_feats = torch.cat((geom_feats, batch_ix), 1)
+
+        train_gt_mask = None
+        target = gt_occ.clone()
+        if gt_occ is not None:
+            valid = (geom_feats[..., 0] >= 0) & (geom_feats[..., 0] < self.grid_size[0]) \
+               & (geom_feats[..., 1] >= 0) & (geom_feats[..., 1] < self.grid_size[1]) \
+               & (geom_feats[..., 2] >= 0) & (geom_feats[..., 2] < self.grid_size[2])
+            train_gt_mask = (torch.ones_like(valid)*255).long()
+            train_gt_mask[valid] = target[
+                geom_feats[valid][..., 3].long(),
+                geom_feats[valid][..., 0].long(),
+                geom_feats[valid][..., 1].long(),
+                geom_feats[valid][..., 2].long()
+            ].long()
+            train_gt_mask = train_gt_mask.view(B, N, D, H, W)
+
+        return train_gt_mask
+
+    def get_seg_prob(self, x):
+        B, C, H, W = x.shape
+        return x.softmax(dim=1)
+    
     def voxel_pooling(self, geom_feats, x):
         B, N, D, H, W, C = x.shape
         Nprime = B * N * D * H * W
@@ -333,63 +517,290 @@ class ViewTransformerLiftSplatShootVoxel(ViewTransformerLSSBEVDepth):
 
         return final
     
-    def get_seg_gt_from_occ(self, geom_feats, gt_occ):
-        B, N, D, H, W, C = geom_feats.shape
-        Nprime = B * N * D * H * W
-        # flatten indices
-        geom_feats = ((geom_feats - self.grid_lower_bound.to(geom_feats.device)) / self.grid_interval.to(geom_feats.device)).long()
-        geom_feats = geom_feats.view(Nprime, 3)
-        batch_ix = torch.cat([torch.full([Nprime // B, 1], ix, device=geom_feats.device, dtype=torch.long) for ix in range(B)])
-        geom_feats = torch.cat((geom_feats, batch_ix), 1)
+    def get_ego_coor(self, sensor2ego, ego2global, cam2imgs, post_rots, post_trans,
+                     bda):
 
-        train_gt_mask = None
-        target = gt_occ.clone()
-        if gt_occ is not None:
-            valid = (geom_feats[..., 0] >= 0) & (geom_feats[..., 0] < self.grid_size[0]) \
-               & (geom_feats[..., 1] >= 0) & (geom_feats[..., 1] < self.grid_size[1]) \
-               & (geom_feats[..., 2] >= 0) & (geom_feats[..., 2] < self.grid_size[2])
-            train_gt_mask = (torch.ones_like(valid)*self.empty_idx).long()
-            train_gt_mask[valid] = target[
-                geom_feats[valid][..., 3].long(),
-                geom_feats[valid][..., 0].long(),
-                geom_feats[valid][..., 1].long(),
-                geom_feats[valid][..., 2].long()
-            ].long()
-            train_gt_mask = train_gt_mask.view(B, N, D, H, W)
+        B, N, _, _ = sensor2ego.shape
+        points = self.frustum.to(sensor2ego) - post_trans.view(B, N, 1, 1, 1, 3)
 
-        return train_gt_mask
-
-    def get_seg_prob(self, x):
-        B, C, H, W = x.shape
-        return x.softmax(dim=1)
+        post_rots_inv = torch.inverse(post_rots)
+        
+        post_rots_inv= post_rots_inv.view(B, N, 1, 1, 1, 3, 3)
+        
+        points = post_rots_inv.matmul(points.unsqueeze(-1))
+        # points = torch.einsum('bnij,bndhwj->bndhwi', torch.inverse(post_rots), points)
+        
+        points = torch.cat(
+            (points[..., :2, :] * points[..., 2:3, :], points[..., 2:3, :]), 5)
+        
+        combine = sensor2ego[:, :, :3, :3].matmul(torch.inverse(cam2imgs))
+        
+        points = combine.view(B, N, 1, 1, 1, 3, 3).matmul(points).squeeze(-1)
+        
+        points += sensor2ego[:, :, :3, 3].view(B, N, 1, 1, 1, 3)
+        
+        points = bda.view(B, 1, 1, 1, 1, 3,
+                          3).matmul(points.unsqueeze(-1)).squeeze(-1)
+        
+        return points
     
-    def forward(self, input):
+    def voxel_pooling_v2(self, coor, depth, feat):
+        if not self.accelerate:
+            ranks_bev, ranks_depth, ranks_feat, \
+                interval_starts, interval_lengths = \
+                self.voxel_pooling_prepare_v2(coor)
+        else:
+            ranks_bev = self.ranks_bev
+            ranks_depth = self.ranks_depth
+            ranks_feat = self.ranks_feat
+            interval_starts = self.interval_starts
+            interval_lengths = self.interval_lengths
+        if ranks_feat is None:
+            print('warning ---> no points within the predefined '
+                  'bev receptive field')
+            dummy = torch.zeros(size=[
+                feat.shape[0], feat.shape[2],
+                int(self.grid_size[2]),
+                int(self.grid_size[1]),
+                int(self.grid_size[0])
+            ]).to(feat) 
+            dummy = torch.cat(dummy.unbind(dim=2), 1)
+            return dummy
+
+        feat = feat.permute(0, 1, 3, 4, 2) 
+        bev_feat_shape = (depth.shape[0], int(self.grid_size[2]),
+                          int(self.grid_size[1]), int(self.grid_size[0]),
+                          feat.shape[-1])
+        bev_feat = bev_pool_v2(depth, feat, ranks_depth, ranks_feat, ranks_bev,
+                               bev_feat_shape, interval_starts,
+                               interval_lengths)
+        # if self.collapse_z:
+        #     bev_feat = torch.cat(bev_feat.unbind(dim=2), 1)
+        return bev_feat
+
+    def voxel_pooling_v3(self, coor, depth, feat, dist_embed):
+        if not self.accelerate:
+            ranks_bev, ranks_depth, ranks_feat, \
+                interval_starts, interval_lengths = \
+                self.voxel_pooling_prepare_v3(coor, depth)
+        else:
+            ranks_bev = self.ranks_bev
+            ranks_depth = self.ranks_depth
+            ranks_feat = self.ranks_feat
+            interval_starts = self.interval_starts
+            interval_lengths = self.interval_lengths
+        if ranks_feat is None:
+            print('warning ---> no points within the predefined '
+                  'bev receptive field')
+            dummy = torch.zeros(size=[
+                feat.shape[0], feat.shape[2],
+                int(self.grid_size[2]),
+                int(self.grid_size[1]),
+                int(self.grid_size[0])
+            ]).to(feat) 
+            dummy = torch.cat(dummy.unbind(dim=2), 1)
+            return dummy
+        feat = feat.permute(0, 1, 3, 4, 2)
+        dist_embed = dist_embed.permute(0, 1, 3, 4, 5, 2)
+        bev_feat_shape = (depth.shape[0], int(self.grid_size[2]),
+                          int(self.grid_size[1]), int(self.grid_size[0]),
+                          feat.shape[-1])
+
+        bev_feat = bev_pool_v3(depth, feat, dist_embed, ranks_depth, ranks_feat, ranks_bev,
+                               bev_feat_shape, interval_starts,
+                               interval_lengths)
+
+        # if self.collapse_z:
+        #     bev_feat = torch.cat(bev_feat.unbind(dim=2), 1)
+        return bev_feat
+
+
+    def voxel_pooling_prepare_v2(self, coor):
+        B, N, D, H, W, _ = coor.shape
+        num_points = B * N * D * H * W
+        ranks_depth = torch.range(
+            0, num_points - 1, dtype=torch.int, device=coor.device) 
+        ranks_feat = torch.range(
+            0, num_points // D - 1, dtype=torch.int, device=coor.device) 
+        ranks_feat = ranks_feat.reshape(B, N, 1, H, W)
+        ranks_feat = ranks_feat.expand(B, N, D, H, W).flatten()
+
+        coor = ((coor - self.grid_lower_bound.to(coor)) /
+                self.grid_interval.to(coor))
+        coor = coor.long().view(num_points, 3) 
+        batch_idx = torch.range(0, B - 1).reshape(B, 1). \
+            expand(B, num_points // B).reshape(num_points, 1).to(coor)
+        coor = torch.cat((coor, batch_idx), 1) 
+
+        kept = (coor[:, 0] >= 0) & (coor[:, 0] < self.grid_size[0]) & \
+               (coor[:, 1] >= 0) & (coor[:, 1] < self.grid_size[1]) & \
+               (coor[:, 2] >= 0) & (coor[:, 2] < self.grid_size[2])
+        if len(kept) == 0:
+            return None, None, None, None, None
+        coor, ranks_depth, ranks_feat = \
+            coor[kept], ranks_depth[kept], ranks_feat[kept]
+
+        ranks_bev = coor[:, 3] * (
+            self.grid_size[2] * self.grid_size[1] * self.grid_size[0])
+        ranks_bev += coor[:, 2] * (self.grid_size[1] * self.grid_size[0])
+        ranks_bev += coor[:, 1] * self.grid_size[0] + coor[:, 0]
+        order = ranks_bev.argsort()
+        ranks_bev, ranks_depth, ranks_feat = \
+            ranks_bev[order], ranks_depth[order], ranks_feat[order]
+
+        kept = torch.ones(
+            ranks_bev.shape[0], device=ranks_bev.device, dtype=torch.bool)
+        kept[1:] = ranks_bev[1:] != ranks_bev[:-1]
+        interval_starts = torch.where(kept)[0].int()
+        if len(interval_starts) == 0:
+            return None, None, None, None, None
+        interval_lengths = torch.zeros_like(interval_starts)
+        interval_lengths[:-1] = interval_starts[1:] - interval_starts[:-1]
+        interval_lengths[-1] = ranks_bev.shape[0] - interval_starts[-1]
+        return ranks_bev.int().contiguous(), ranks_depth.int().contiguous(
+        ), ranks_feat.int().contiguous(), interval_starts.int().contiguous(
+        ), interval_lengths.int().contiguous()
+    
+    def voxel_pooling_prepare_v3(self, coor, mask):
+        B, N, D, H, W, _ = coor.shape
+        num_points = B * N * D * H * W
+        ranks_depth = torch.range(
+            0, num_points - 1, dtype=torch.int, device=coor.device) 
+        ranks_feat = torch.range(
+            0, num_points // D - 1, dtype=torch.int, device=coor.device) 
+        ranks_feat = ranks_feat.reshape(B, N, 1, H, W)
+        ranks_feat = ranks_feat.expand(B, N, D, H, W).flatten()
+
+        coor = ((coor - self.grid_lower_bound.to(coor)) /
+                self.grid_interval.to(coor))
+        coor = coor.long().view(num_points, 3)
+        mask = mask.view(num_points)
+        batch_idx = torch.range(0, B - 1).reshape(B, 1). \
+            expand(B, num_points // B).reshape(num_points, 1).to(coor)
+        coor = torch.cat((coor, batch_idx), 1) 
+
+        kept = (coor[:, 0] >= 0) & (coor[:, 0] < self.grid_size[0]) & \
+               (coor[:, 1] >= 0) & (coor[:, 1] < self.grid_size[1]) & \
+               (coor[:, 2] >= 0) & (coor[:, 2] < self.grid_size[2]) & mask
+        if len(kept) == 0:
+            return None, None, None, None, None
+        coor, ranks_depth, ranks_feat = \
+            coor[kept], ranks_depth[kept], ranks_feat[kept]
+
+        ranks_bev = coor[:, 3] * (
+            self.grid_size[2] * self.grid_size[1] * self.grid_size[0])
+        ranks_bev += coor[:, 2] * (self.grid_size[1] * self.grid_size[0])
+        ranks_bev += coor[:, 1] * self.grid_size[0] + coor[:, 0]
+        order = ranks_bev.argsort()
+        ranks_bev, ranks_depth, ranks_feat = \
+            ranks_bev[order], ranks_depth[order], ranks_feat[order]
+
+        kept = torch.ones(
+            ranks_bev.shape[0], device=ranks_bev.device, dtype=torch.bool)
+        kept[1:] = ranks_bev[1:] != ranks_bev[:-1]
+        interval_starts = torch.where(kept)[0].int()
+        if len(interval_starts) == 0:
+            return None, None, None, None, None
+        interval_lengths = torch.zeros_like(interval_starts)
+        interval_lengths[:-1] = interval_starts[1:] - interval_starts[:-1]
+        interval_lengths[-1] = ranks_bev.shape[0] - interval_starts[-1]
+        return ranks_bev.int().contiguous(), ranks_depth.int().contiguous(
+        ), ranks_feat.int().contiguous(), interval_starts.int().contiguous(
+        ), interval_lengths.int().contiguous()
+    
+    def init_acceleration_v2(self, coor):
+        ranks_bev, ranks_depth, ranks_feat, \
+            interval_starts, interval_lengths = \
+            self.voxel_pooling_prepare_v2(coor)
+        self.ranks_bev = ranks_bev.int().contiguous()
+        self.ranks_feat = ranks_feat.int().contiguous()
+        self.ranks_depth = ranks_depth.int().contiguous()
+        self.interval_starts = interval_starts.int().contiguous()
+        self.interval_lengths = interval_lengths.int().contiguous()
+
+    def pre_compute(self, input):
+        if self.initial_flag:
+            coor = self.get_ego_coor(*input[1:7])  
+            self.init_acceleration_v2(coor)
+            self.initial_flag = False
+
+    def get_mlp_input_nus(self, sensor2ego, ego2global, intrin, post_rot, post_tran, bda):
+        B, N, _, _ = sensor2ego.shape
+        bda = bda.view(B, 1, 3, 3).repeat(1, N, 1, 1)
+        mlp_input = torch.stack([
+            intrin[:, :, 0, 0],
+            intrin[:, :, 1, 1],
+            intrin[:, :, 0, 2],
+            intrin[:, :, 1, 2],
+            post_rot[:, :, 0, 0],
+            post_rot[:, :, 0, 1],
+            post_tran[:, :, 0],
+            post_rot[:, :, 1, 0],
+            post_rot[:, :, 1, 1],
+            post_tran[:, :, 1],
+            bda[:, :, 0, 0],
+            bda[:, :, 0, 1],
+            bda[:, :, 1, 0],
+            bda[:, :, 1, 1],
+            bda[:, :, 2, 2],
+        ],
+                                dim=-1)
+        sensor2ego = sensor2ego[:, :, :3, :].reshape(B, N, -1)
+        mlp_input = torch.cat([mlp_input, sensor2ego], dim=-1)
+        return mlp_input
+    
+    def forward(self, input, img_metas=None):
         (x, rots, trans, intrins, post_rots, post_trans, bda, mlp_input) = input[:8]
         B, N, C, H, W = x.shape
 
         x = x.view(B * N, C, H, W)
-        x, seg_out = self.depth_net(x, mlp_input)
+        if self.dataset == 'nuscenes':
+            mlp_input = self.get_mlp_input_nus(*input[1:7])
+
+        x, seg_out = self.depth_net(x, mlp_input)     
+
         depth_digit = x[:, :self.D, ...]
         img_feat = x[:, self.D:self.D + self.numC_Trans, ...]
+
         depth_prob = self.get_depth_dist(depth_digit)
         seg_prob = self.get_seg_prob(seg_out)
-        geom = self.get_geometry(
-            rots=rots, trans=trans, intrins=intrins, 
-            post_rots=post_rots, post_trans=post_trans, bda=bda)
-                    
-        hazard = torch.cumsum(depth_prob.detach(), dim=1)
-        seg_mask = (seg_prob.detach()[:,self.empty_idx,...] < 0.9).unsqueeze(1).repeat(1, self.D, 1, 1)
-        mask = (hazard > 0.1)&(seg_mask)
+           
+        hazard = torch.cumsum(depth_prob, dim=1)
+
+        
+        seg_mask = (1-seg_prob[:,self.empty_idx,...] > self.seg_pruning_ratio).unsqueeze(1).repeat(1, self.D, 1, 1)
+        mask = (hazard > self.depth_pruning_ratio)&(seg_mask)
+        
         opacity_embeds = self.opacity_embedding(
-            depth_prob.detach(),
+            depth_prob,
         ).to(img_feat.dtype)  # B*N, D, H, W, C
-
-        img_feat = img_feat.unsqueeze(2) + opacity_embeds
-        volume = mask.unsqueeze(1) * img_feat
-        volume = volume.view(B, N, -1, self.D, H, W)
-        volume = volume.permute(0, 1, 3, 4, 5, 2)  # B, N, D, H, W, C
-
+        
         # Splat
-        bev_feat = self.voxel_pooling(geom, volume)
+        if self.dataset == 'semantickitti':
+            img_feat = img_feat.unsqueeze(2) + opacity_embeds
+            volume = mask.unsqueeze(1) * img_feat
+            volume = volume.view(B, N, -1, self.D, H, W)
+            volume = volume.permute(0, 1, 3, 4, 5, 2)  # B, N, D, H, W, C
+
+            geom = self.get_geometry(
+                rots=rots, trans=trans, intrins=intrins, 
+                post_rots=post_rots, post_trans=post_trans, bda=bda)
+
+            bev_feat = self.voxel_pooling(geom, volume)
+        elif self.dataset == 'nuscenes':
+            if self.accelerate:
+                self.pre_compute(input)
+                geom = self.get_ego_coor(*input[1:7])
+            else:
+
+                geom = self.get_ego_coor(*input[1:7])
+                
+            opacity_embeds = opacity_embeds.view(B, N, -1, self.D, H, W)
+            dist_embed = opacity_embeds
+
+            bev_feat = self.voxel_pooling_v3(
+                geom, mask.view(B, N, self.D, H, W),
+                img_feat.view(B, N, self.numC_Trans, H, W),
+                dist_embed.view(B, N, self.numC_Trans, self.D, H, W)).permute(0, 1, 4, 3, 2)
 
         return bev_feat, depth_prob, seg_out

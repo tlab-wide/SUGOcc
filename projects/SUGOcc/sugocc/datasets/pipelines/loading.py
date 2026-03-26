@@ -13,7 +13,6 @@ from mmdet.datasets.transforms import LoadAnnotations
 from mmcv.transforms.loading import LoadImageFromFile
 from mmdet3d.structures import LiDARInstance3DBoxes
 from mmengine.registry import TRANSFORMS
-# from mmdet3d.datasets.builder import PIPELINES
 from torchvision.transforms.functional import rotate
 from copy import deepcopy
 from mmdet3d.datasets.transforms import LoadPointsFromFile
@@ -80,6 +79,7 @@ class PrepareImageInputs(object):
                          newH) - fH     # s * H - H_in
             crop_w = int(np.random.uniform(0, max(0, newW - fW)))       # max(0, s * W - fW)
             crop = (crop_w, crop_h, crop_w + fW, crop_h + fH)
+            
             flip = self.data_config['flip'] and np.random.choice([0, 1])
             rotate = np.random.uniform(*self.data_config['rot'])
         else:
@@ -362,7 +362,7 @@ class LoadAnnotationsBEVDepth(object):
 
     def __call__(self, results):
         gt_boxes, gt_labels = results['ann_infos']      # (N_gt, 9),  (N_gt, )
-        gt_boxes, gt_labels = torch.Tensor(gt_boxes), torch.tensor(gt_labels)
+        gt_boxes, gt_labels = torch.Tensor(np.array(gt_boxes)), torch.tensor(np.array(gt_labels))
         rotate_bda, scale_bda, flip_dx, flip_dy = self.sample_bda_augmentation()
 
         bda_mat = torch.zeros(4, 4)
@@ -508,7 +508,7 @@ class LoadOccGTFromFile(object):
     def __call__(self, results):
         occ_gt_path = results['occ_gt_path']
         occ_gt_path = os.path.join(occ_gt_path, "labels.npz")
-
+        # print(occ_gt_path)
         occ_labels = np.load(occ_gt_path)
         semantics = occ_labels['semantics']
         mask_lidar = occ_labels['mask_lidar']
@@ -527,9 +527,28 @@ class LoadOccGTFromFile(object):
         if self.ignore_nonvisible:
             semantics[~mask_camera.to(torch.bool)] = 255
         
+        results['voxel_semantics'] = semantics
+        
+        gt_occ = [semantics.long()]
+        # print(gt_occ[-1].shape, torch.unique(gt_occ[-1], return_counts=True))
+        for i in range(3):
+            if self.ignore_nonvisible:
+                label_path = occ_gt_path.replace('labels.npz', f'labels_1_{2**(i+1)}.npy')
+                ds_gt = torch.from_numpy(np.load(label_path))
+            else:
+                label_path = occ_gt_path.replace('labels.npz', f'labels_1_{2**(i+1)}.npz')
+                ds_gt = torch.from_numpy(np.load(label_path)['semantics'])
+                ds_mask = torch.from_numpy(np.load(label_path)['mask_camera'])
+                
+            gt_occ.append(ds_gt)
+
         if results['rotate_bda'] != 0:
             semantics = semantics.permute(2, 0, 1)
             semantics = rotate(semantics, results['rotate_bda'], fill=255).permute(1, 2, 0)
+            for i, gt in enumerate(gt_occ):
+                gt = gt.permute(2, 0, 1)
+                gt = rotate(gt, results['rotate_bda'], fill=255).permute(1, 2, 0)
+                gt_occ[i] = gt
             if self.return_non_vis:
                 non_vis_semantic_voxel = non_vis_semantic_voxel.permute(2, 0, 1)
                 non_vis_semantic_voxel = rotate(non_vis_semantic_voxel, results['rotate_bda'], fill=255).permute(1, 2, 0)
@@ -538,6 +557,8 @@ class LoadOccGTFromFile(object):
             semantics = torch.flip(semantics, [0])
             mask_lidar = torch.flip(mask_lidar, [0])
             mask_camera = torch.flip(mask_camera, [0])
+            for i, gt in enumerate(gt_occ):
+                gt_occ[i] = torch.flip(gt, [0])
             if self.return_non_vis:
                 non_vis_semantic_voxel = torch.flip(non_vis_semantic_voxel, [0])
 
@@ -545,58 +566,17 @@ class LoadOccGTFromFile(object):
             semantics = torch.flip(semantics, [1])
             mask_lidar = torch.flip(mask_lidar, [1])
             mask_camera = torch.flip(mask_camera, [1])
+            for i, gt in enumerate(gt_occ):
+                gt_occ[i] = torch.flip(gt, [1])
             if self.return_non_vis:
                 non_vis_semantic_voxel = torch.flip(non_vis_semantic_voxel, [0])
 
-        results['voxel_semantics'] = semantics
-        
-        gt_occ = [semantics.long()]
-        for i in range(3):
-            gt_occ.append(
-                self.downsample_voxel(gt_occ[i].unsqueeze(0), 2).squeeze(0))
         results['gt_occ'] = gt_occ
-        if 'eval_ann_info' in results:
-            results['eval_ann_info']['occ_gt_path'] = occ_gt_path
-            # results['eval_ann_info']['mask_lidar'] = mask_lidar
-            # results['eval_ann_info']['mask_camera'] = mask_camera
         results['mask_lidar'] = mask_lidar
         results['mask_camera'] = mask_camera
         results['non_vis_semantic_voxel'] = non_vis_semantic_voxel
 
         return results
-    
-    def downsample_voxel(self, input_tensor, ratio): # for semantic kitti
-        B, X, Y, Z = input_tensor.shape
-        # gt_pts = []
-        # for b in range(B):
-        #     non_empty = torch.nonzero((input_tensor[b] != 17)&(input_tensor[b] != 255))
-        #     values = input_tensor[b][non_empty[:,0],non_empty[:,1],non_empty[:,2]]
-        #     pts = torch.cat([
-        #         non_empty,
-        #         values.unsqueeze(1)
-        #     ], dim=1)
-        #     gt_pts.append(pts.float())
-        # gt = 255*torch.ones([B, X//2, Y//2, Z//2]).to(input_tensor.device).type(torch.float) 
-        # for b in range(gt.shape[0]):
-        #     coords = gt_pts[b][:, :3].type(torch.long) // ratio
-        #     gt[b, coords[:, 0], coords[:, 1], coords[:, 2]] =  gt_pts[b][:, 3]
-        # return gt
-        tensor = input_tensor.clone()
-        tensor = tensor.view(B, X // ratio, ratio, Y // ratio, ratio, Z // ratio, ratio).permute(0,1,3,5,2,4,6).flatten(4)
-        downsampled_tensor, _ = torch.mode(tensor, dim=(-1), keepdim=False)
-        # print(downsampled_tensor.shape)
-        temp = downsampled_tensor.clone()
-        all_empty_or_255_mask = ((tensor == 17) | (tensor == 255)).all(dim=(-1))
-        non_empty_and_non_255_mask = ~all_empty_or_255_mask
-        filtered_tensor = tensor[non_empty_and_non_255_mask]
-        filtered_tensor[filtered_tensor == 255] = -1
-        # print(filtered_tensor.sort(dim=-1), filtered_tensor.sort(dim=-1)[0].shape)
-        filtered_tensor = filtered_tensor.sort(dim=-1)[0][:,-1]
-        
-        if filtered_tensor.numel() > 0:
-            downsampled_tensor[non_empty_and_non_255_mask] = filtered_tensor
-            
-        return downsampled_tensor
 
 @TRANSFORMS.register_module()
 class LoadLidarsegFromFile(LoadPointsFromFile):

@@ -32,11 +32,21 @@ class SELayer(nn.Module):
         # return self.broadcast_mul(x, y)
         
 class BasicConvolutionBlock(nn.Module):
-    def __init__(self, inc, outc, ks=3, stride=1, dilation=1, D=3):
+    def __init__(self, inc, outc, ks=3, stride=1, dilation=1, D=3, cross_kernel=False):
         super().__init__()
+        if cross_kernel:
+            kernel_generator = ME.KernelGenerator(
+                ks,
+                stride,
+                dilation,
+                region_type=ME.RegionType.HYPER_CROSS,
+                dimension=D)
+        else:
+            kernel_generator = None
         self.net = nn.Sequential(
             ME.MinkowskiConvolution(
-                inc, outc, kernel_size=ks, dilation=dilation, stride=stride, dimension=D
+                inc, outc, kernel_size=ks, dilation=dilation, stride=stride, dimension=D,
+                kernel_generator=kernel_generator
             ),
             ME.MinkowskiBatchNorm(outc),
             ME.MinkowskiLeakyReLU(inplace=True),
@@ -65,9 +75,10 @@ class BasicGenerativeDeconvolutionBlock(nn.Module):
 class BasicDeconvolutionBlock(nn.Module):
     def __init__(self, inc, outc, ks=3, stride=1, D=3):
         super().__init__()
+        
         self.net = nn.Sequential(
             ME.MinkowskiConvolutionTranspose(
-                inc, outc, kernel_size=ks, stride=stride, dimension=D
+                inc, outc, kernel_size=ks, stride=stride, dimension=D,
             ),
             ME.MinkowskiBatchNorm(outc),
             ME.MinkowskiLeakyReLU(inplace=True),
@@ -352,23 +363,24 @@ class SPCDense3Dv2(nn.Module):
         return x
 
 class AttentionModule3D(BaseModule):
-    def __init__(self, dim):
+    def __init__(self, dim, kernels=[(7, 7, 3), (11, 11, 3), (15, 15, 3)]):
         super().__init__()
+        self.kernels = kernels
         self.conv0 = nn.Conv3d(dim, dim, (5, 5, 3), padding=(2, 2, 1), groups=dim)
-        self.conv0_1 = nn.Conv3d(dim, dim, (1, 7, 1), padding=(0, 3, 0), groups=dim)
-        self.conv0_2 = nn.Conv3d(dim, dim, (7, 1, 1), padding=(3, 0, 0), groups=dim)
-        self.conv0_3 = nn.Conv3d(dim, dim, (1, 1, 3), padding=(0, 0, 1), groups=dim)
+        self.conv0_1 = nn.Conv3d(dim, dim, (1, kernels[0][1], 1), padding=(0, kernels[0][1]//2, 0), groups=dim)
+        self.conv0_2 = nn.Conv3d(dim, dim, (kernels[0][0], 1, 1), padding=(kernels[0][0]//2, 0, 0), groups=dim)
+        self.conv0_3 = nn.Conv3d(dim, dim, (1, 1, kernels[0][2]), padding=(0, 0, kernels[0][2]//2), groups=dim)
 
-        self.conv1_1 = nn.Conv3d(dim, dim, (1, 11, 1), padding=(0, 5, 0), groups=dim)
-        self.conv1_2 = nn.Conv3d(dim, dim, (11, 1, 1), padding=(5, 0, 0), groups=dim)
-        self.conv1_3 = nn.Conv3d(dim, dim, (1, 1, 3), padding=(0, 0, 1), groups=dim)
+        self.conv1_1 = nn.Conv3d(dim, dim, (1, kernels[1][1], 1), padding=(0, kernels[1][1]//2, 0), groups=dim)
+        self.conv1_2 = nn.Conv3d(dim, dim, (kernels[1][0], 1, 1), padding=(kernels[1][0]//2, 0, 0), groups=dim)
+        self.conv1_3 = nn.Conv3d(dim, dim, (1, 1, kernels[1][2]), padding=(0, 0, kernels[1][2]//2), groups=dim)
 
         self.conv2_1 = nn.Conv3d(
-            dim, dim, (1, 15, 1), padding=(0, 7, 0), groups=dim)
+            dim, dim, (1, kernels[2][1], 1), padding=(0, kernels[2][1]//2, 0), groups=dim)
         self.conv2_2 = nn.Conv3d(
-            dim, dim, (15, 1, 1), padding=(7, 0, 0), groups=dim)
+            dim, dim, (kernels[2][0], 1, 1), padding=(kernels[2][0]//2, 0, 0), groups=dim)
         self.conv2_3 = nn.Conv3d(
-            dim, dim, (1, 1, 3), padding=(0, 0, 1), groups=dim)
+            dim, dim, (1, 1, kernels[2][2]), padding=(0, 0, kernels[2][2]//2), groups=dim)
         self.conv3 = nn.Conv3d(dim, dim, 1)
 
     def forward(self, x):
@@ -395,12 +407,12 @@ class AttentionModule3D(BaseModule):
 
 
 class SpatialAttention3D(BaseModule):
-    def __init__(self, d_model):
+    def __init__(self, d_model, kernels=[(7, 7, 3), (11, 11, 3), (15, 15, 3)]):
         super().__init__()
         self.d_model = d_model
         self.proj_1 = nn.Conv3d(d_model, d_model, 1)
         self.activation = nn.GELU()
-        self.spatial_gating_unit = AttentionModule3D(d_model)
+        self.spatial_gating_unit = AttentionModule3D(d_model, kernels=kernels)
         self.proj_2 = nn.Conv3d(d_model, d_model, 1)
 
     def forward(self, x):
@@ -451,10 +463,11 @@ class MSCABlock(BaseModule):
                  drop=0.,
                  drop_path=0.,
                  act_layer=nn.GELU,
+                 kernels=[(7, 7, 3), (11, 11, 3), (15, 15, 3)],
                  norm_cfg=dict(type='SyncBN', requires_grad=True)):
         super().__init__()
         self.norm1 = build_norm_layer(norm_cfg, dim)[1]
-        self.attn = SpatialAttention3D(dim)
+        self.attn = SpatialAttention3D(dim, kernels=kernels)
         self.drop_path = DropPath(
             drop_path) if drop_path > 0. else nn.Identity()
         self.norm2 = build_norm_layer(norm_cfg, dim)[1]

@@ -35,7 +35,7 @@ pip install mmcv==2.0.0rc4 -f https://download.openmmlab.com/mmcv/dist/cu117/tor
 pip install mmdet==3.3.0 mmsegmentation==1.2.2 mmdet3d==1.4.0
 
 ## Minkowski Engine
-conda install openblas-devel -c anaconda
+conda install openblas-devel libxcrypt -c anaconda -c conda-forge
 pip install -U git+https://github.com/NVIDIA/MinkowskiEngine -v --no-deps --global-option="--blas_include_dirs=${CONDA_PREFIX}/include" --global-option="--blas=openblas"
 
 ## Occ Pool CUDA Operation
