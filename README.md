@@ -107,7 +107,7 @@ bash tools/dist_test.sh projects/SUGOcc/configs/$CONFIG $PTH 1
 
 | Config | Stereo |Backbone | IoU| mIoU | FPS |  Weights|
 |:----------:|:----------:|:----------:|:----------:|:----------:|:----------:|:----------:|
-| [SemanticKITTI](projects/SUGOcc/configs/sugocc_kitti.py)| $ \times $ | ResNet-50 | 35.87 |14.91 | 10.1 | [weights](https://github.com/tlab-wide/SUGOcc/releases/download/V1.0_SemanticKITTI/sugocc_kitti.pth) |
+| [SemanticKITTI](projects/SUGOcc/configs/sugocc_kitti.py)| &#10060; | ResNet-50 | 35.87 |14.91 | 10.1 | [weights](https://github.com/tlab-wide/SUGOcc/releases/download/V1.0_SemanticKITTI/sugocc_kitti.pth) |
 
 
 #### Results on Occ3D-Nuscenes
