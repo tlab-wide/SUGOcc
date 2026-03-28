@@ -269,9 +269,11 @@ class CustomSemanticKITTILssDataset(BaseDataset):
                 lidar2cam=lidar2cam_rts,
             ))
         # gt_occ is None for test-set
+        input_dict['gt_occ'] = self.get_ann_info(index)
         if self.test_mode:
             input_dict['eval_ann_info'] = dict()
-        input_dict['gt_occ'] = self.get_ann_info(index)
+            input_dict['eval_ann_info']['gt_occ'] = input_dict['gt_occ'][0]
+        
         return input_dict
 
     def evaluate(self, results, logger=None, **kwargs):

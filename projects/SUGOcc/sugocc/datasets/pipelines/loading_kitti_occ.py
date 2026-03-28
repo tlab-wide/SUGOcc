@@ -81,10 +81,6 @@ class LoadSemKittiAnnotation():
         results['img_inputs'] = (imgs, rots, trans, intrins, post_rots, post_trans, bda_rot, gt_depths, sensor2sensors, torch.tensor(imgs.shape[-2:]), gt_segs)
         results['gt_occ'] = gt_occ
 
-        if 'eval_ann_info' in results:
-            # assert 'gt_occ' in results['eval_ann_info']
-            results['eval_ann_info']['gt_occ'] = gt_occ[0] if type(gt_occ) is list else gt_occ
-        
         return results
 
 def voxel_transform(voxel_labels, rotate_angle, scale_ratio, flip_dx, flip_dy, flip_dz, transform_center=None):

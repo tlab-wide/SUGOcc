@@ -532,14 +532,13 @@ class LoadOccGTFromFile(object):
         gt_occ = [semantics.long()]
         # print(gt_occ[-1].shape, torch.unique(gt_occ[-1], return_counts=True))
         for i in range(3):
+            label_path = occ_gt_path.replace('labels.npz', f'labels_1_{2**(i+1)}.npz')
+            gt = np.load(label_path)
+            ds_gt = torch.from_numpy(gt['semantics'])
             if self.ignore_nonvisible:
-                label_path = occ_gt_path.replace('labels.npz', f'labels_1_{2**(i+1)}.npy')
-                ds_gt = torch.from_numpy(np.load(label_path))
-            else:
-                label_path = occ_gt_path.replace('labels.npz', f'labels_1_{2**(i+1)}.npz')
-                ds_gt = torch.from_numpy(np.load(label_path)['semantics'])
-                ds_mask = torch.from_numpy(np.load(label_path)['mask_camera'])
-                
+                ds_mask = torch.from_numpy(gt['mask_camera'])
+                ds_gt[~ds_mask.to(torch.bool)] = 255
+                              
             gt_occ.append(ds_gt)
 
         if results['rotate_bda'] != 0:

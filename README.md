@@ -86,8 +86,13 @@ Run the preprocessing scripts to prepare the data for training:
 ```
 PYTHONPATH=$(pwd):$PYTHONPATH python tools/create_data_bevdet.py
 ```
+Run the preprocessing scripts to prepare downsampled labels for training:
+```
+python projects/SUGOcc/sugocc/tools/nus_process/occ3d_nuscenes_preprocess.py --nuscenes_root data/nuscenes
+```
 ### Pre-trained Models
-Download the pre-trained image encoder from [MaskDINO](https://github.com/IDEA-Research/MaskDINO) (maskdino_r50_50e_300q_panoptic_pq53.0.pth)
+Download the pre-trained image encoder from [MaskDINO](https://github.com/IDEA-Research/MaskDINO) (maskdino_r50_50e_300q_panoptic_pq53.0.pth) and [BEVDet](https://github.com/HuangJunJie2017/BEVDet)(bevdet-r50-4d-depth-cbgs.pth)
+
 ### Train & Evaluate
 #### Training
 ```python
@@ -100,13 +105,16 @@ bash tools/dist_test.sh projects/SUGOcc/configs/$CONFIG $PTH 1
 ## Results
 #### Results on SemanticKITTI
 
-| Model | Backbone | mIoU | FPS | Config | Weights|
-|:----------:|:----------:|:----------:|:----------:|:----------:|:----------:|
-| SUGOcc| ResNet-50 | 14.91 | 10.1 | [config](projects/SUGOcc/configs/sugocc_kitti.py) | [weights](https://github.com/tlab-wide/SUGOcc/releases/download/V1.0/sugocc_kitti.pth) |
+| Config | Stereo |Backbone | IoU| mIoU | FPS |  Weights|
+|:----------:|:----------:|:----------:|:----------:|:----------:|:----------:|:----------:|
+| [SemanticKITTI](projects/SUGOcc/configs/sugocc_kitti.py)| $ \times $ | ResNet-50 | 35.87 |14.91 | 10.1 | [weights](https://github.com/tlab-wide/SUGOcc/releases/download/V1.0_SemanticKITTI/sugocc_kitti.pth) |
 
 
 #### Results on Occ3D-Nuscenes
-coming soon
+
+| Config | Temporal | Backbone | RayIoU | mIoU | FPS  | Weights|
+|:----------:|:----------:|:----------:|:----------:|:----------:|:----------:|:----------:|
+| [Occ3D-Nuscenes](projects/SUGOcc/configs/sugocc_nus.py)| 1 Frame |ResNet-50 | 37.01 | 31.56| 11.2 |  [weights](https://github.com/tlab-wide/SUGOcc/releases/download/V1.0_Occ3D-Nuscenes/sugocc_nus3d_womask_miou3156.pth) |
 
 ## Citation
 If you find our work useful for your research, please consider citing the paper:

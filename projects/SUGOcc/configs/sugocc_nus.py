@@ -305,17 +305,6 @@ test_pipeline = [
         type='OccDefaultFormatBundle3D'),
     dict(type='CustomPack3DDetInputs', keys=['img_inputs'],
             meta_keys=['pc_range', 'occ_size','sample_idx','filename']),
-    # dict(
-    #     type='mmdet3d.MultiScaleFlipAug3D',
-    #     img_scale=(1333, 800),
-    #     pts_scale_ratio=1,
-    #     flip=False,
-    #     transforms=[
-    #         dict(
-    #             type='OccDefaultFormatBundle3D'),
-    #         dict(type='CustomPack3DDetInputs', keys=['img_inputs', 'gt_occ'],
-    #              meta_keys=['pc_range', 'occ_size','sample_idx','filename']),
-    #     ])
 ]
 
 input_modality = dict(

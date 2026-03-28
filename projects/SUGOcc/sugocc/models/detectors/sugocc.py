@@ -214,7 +214,6 @@ class SUGOcc(Base3DSegmentor):
 
         img_metas = [data_sample.metainfo for data_sample in batch_data_samples]
 
-
         outs = self.forward_test(img_metas=img_metas, img_inputs=img_inputs)
 
         return self.postprocess_result(outs, batch_data_samples)
