@@ -117,7 +117,7 @@ def main(cfg):
         out_dir = os.path.join(cfg.kitti_preprocess_root, "labels", sequence)
         os.makedirs(out_dir, exist_ok=True)
 
-        downscaling = {"1_2": 2, "1_4": 4, "1_8": 8}
+        downscaling = {"1_2": 2, "1_4": 4, "1_8": 8, "1_16": 16}
 
         for i in tqdm(range(len(label_paths))):
 

@@ -1,5 +1,6 @@
 # Copyright (c) OpenMMLab. All rights reserved.
 import os
+import re
 from unittest import result
 
 import mmcv
@@ -13,6 +14,7 @@ from mmdet.datasets.transforms import LoadAnnotations
 from mmcv.transforms.loading import LoadImageFromFile
 from mmdet3d.structures import LiDARInstance3DBoxes
 from mmengine.registry import TRANSFORMS
+# from mmdet3d.datasets.builder import PIPELINES
 from torchvision.transforms.functional import rotate
 from copy import deepcopy
 from mmdet3d.datasets.transforms import LoadPointsFromFile
@@ -221,9 +223,13 @@ class PrepareImageInputs(object):
                 self.get_sensor_transforms(results['curr'], cam_name)
 
             # image view augmentation (resize, crop, horizontal flip, rotate)
-            img_augs = self.sample_augmentation(
-                H=img.height, W=img.width, flip=flip, scale=scale)
-            resize, resize_dims, crop, flip, rotate = img_augs
+            if results.get('aug_config', None) is not None:
+                aug_config = results['aug_config']
+                resize, resize_dims, crop, flip, rotate = aug_config['resize'], aug_config['resize_dims'], aug_config['crop'], aug_config['flip'], aug_config['rotate']
+            else:
+                img_augs = self.sample_augmentation(
+                    H=img.height, W=img.width, flip=flip, scale=scale)
+                resize, resize_dims, crop, flip, rotate = img_augs
 
             # img: PIL.Image;  post_rot: Tensor (2, 2);  post_tran: Tensor (2, )
             img, post_rot2, post_tran2 = \
@@ -363,7 +369,11 @@ class LoadAnnotationsBEVDepth(object):
     def __call__(self, results):
         gt_boxes, gt_labels = results['ann_infos']      # (N_gt, 9),  (N_gt, )
         gt_boxes, gt_labels = torch.Tensor(np.array(gt_boxes)), torch.tensor(np.array(gt_labels))
-        rotate_bda, scale_bda, flip_dx, flip_dy = self.sample_bda_augmentation()
+        if results.get('aug_config', None) is not None:
+            aug_config = results['aug_config']
+            rotate_bda, scale_bda, flip_dx, flip_dy = aug_config['rotate_bda'], aug_config['scale_bda'], aug_config['flip_dx_bda'], aug_config['flip_dy_bda']
+        else:
+            rotate_bda, scale_bda, flip_dx, flip_dy = self.sample_bda_augmentation()
 
         bda_mat = torch.zeros(4, 4)
         bda_mat[3, 3] = 1
@@ -508,7 +518,6 @@ class LoadOccGTFromFile(object):
     def __call__(self, results):
         occ_gt_path = results['occ_gt_path']
         occ_gt_path = os.path.join(occ_gt_path, "labels.npz")
-        # print(occ_gt_path)
         occ_labels = np.load(occ_gt_path)
         semantics = occ_labels['semantics']
         mask_lidar = occ_labels['mask_lidar']
@@ -530,15 +539,15 @@ class LoadOccGTFromFile(object):
         results['voxel_semantics'] = semantics
         
         gt_occ = [semantics.long()]
-        # print(gt_occ[-1].shape, torch.unique(gt_occ[-1], return_counts=True))
         for i in range(3):
-            label_path = occ_gt_path.replace('labels.npz', f'labels_1_{2**(i+1)}.npz')
-            gt = np.load(label_path)
-            ds_gt = torch.from_numpy(gt['semantics'])
             if self.ignore_nonvisible:
-                ds_mask = torch.from_numpy(gt['mask_camera'])
-                ds_gt[~ds_mask.to(torch.bool)] = 255
-                              
+                label_path = occ_gt_path.replace('labels.npz', f'labels_1_{2**(i+1)}.npy')
+                ds_gt = torch.from_numpy(np.load(label_path))
+            else:
+                label_path = occ_gt_path.replace('labels.npz', f'labels_1_{2**(i+1)}.npz')
+                ds_gt = torch.from_numpy(np.load(label_path)['semantics'])
+                ds_mask = torch.from_numpy(np.load(label_path)['mask_camera'])
+                
             gt_occ.append(ds_gt)
 
         if results['rotate_bda'] != 0:

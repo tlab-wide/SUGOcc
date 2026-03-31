@@ -25,6 +25,9 @@ class SUGOcc(Base3DSegmentor):
                  loss_norm=False,
                  train_cfg=None,
                  test_cfg=None,
+                 downsample=16,
+                 grid_config=None,
+                 do_use_history=False,
                  dataset='semantickitti',
                  **kwargs):
         super().__init__(**kwargs)
@@ -35,6 +38,14 @@ class SUGOcc(Base3DSegmentor):
         self.nonempty_num = 0
         self.sample_num = 0
         self.dataset = dataset
+        self.do_use_history = do_use_history
+        self.num_frame = 1 if not do_use_history else 2
+        self.history_stereo_feat = None
+        self.history_img_metas = None
+        self.history_img_inputs = None
+        self.history_voxel_feat = None
+        self.grid_config = grid_config
+        self.downsample = downsample
         if img_neck is not None:
             self.img_neck = MODELS.build(img_neck)
         else:
@@ -86,7 +97,36 @@ class SUGOcc(Base3DSegmentor):
 
         return [imgs, sensor2keyegos, ego2globals, intrins,
                 post_rots, post_trans, bda]
-    
+
+    def get_curr2adjsensor(self, curr_inputs, history_inputs, start_of_sequence):
+        B, N, C, H, W = curr_inputs[0].shape
+
+        sensor2egos, ego2globals, intrins, post_rots, post_trans = curr_inputs[1:6]
+        sensor2egos_hist, ego2globals_hist, intrins_hist, post_rots_hist, post_trans_hist = history_inputs[1:6]
+        sensor2egos = sensor2egos.view(B, 1, N, 4, 4).contiguous()
+        ego2globals = ego2globals.view(B, 1, N, 4, 4).contiguous()
+        sensor2egos_hist = sensor2egos_hist.view(B, 1, N, 4, 4).contiguous()
+        ego2globals_hist = ego2globals_hist.view(B, 1, N, 4, 4).contiguous()
+
+        if start_of_sequence.sum() > 0:
+            sensor2egos_hist[start_of_sequence] = sensor2egos[start_of_sequence]
+            ego2globals_hist[start_of_sequence] = ego2globals[start_of_sequence]
+            intrins_hist[start_of_sequence] = intrins[start_of_sequence]
+            post_rots_hist[start_of_sequence] = post_rots[start_of_sequence]
+            post_trans_hist[start_of_sequence] = post_trans[start_of_sequence]
+
+        sensor2egos_cv, ego2globals_cv = sensor2egos, ego2globals
+        sensor2egos_curr = sensor2egos_cv.double()
+        ego2globals_curr = ego2globals_cv.double()
+        sensor2egos_adj = sensor2egos_hist.double()
+        ego2globals_adj = ego2globals_hist.double()
+        curr2adjsensor = \
+            torch.inverse(ego2globals_adj @ sensor2egos_adj) \
+            @ ego2globals_curr @ sensor2egos_curr
+        curr2adjsensor = curr2adjsensor.float().squeeze(1)
+
+        return [history_inputs[0], sensor2egos_hist, ego2globals_hist, intrins_hist, post_rots_hist, post_trans_hist, *history_inputs[6:]], curr2adjsensor
+
     def image_encoder(self, img, stereo=False):
         imgs = img
         B, N, C, imH, imW = imgs.shape
@@ -138,7 +178,7 @@ class SUGOcc(Base3DSegmentor):
         
         return x, voxel_seg_logits
 
-    def extract_img_feat(self, img):
+    def extract_img_feat(self, img, img_metas=None):
         """Extract features of images."""
 
         if self.record_time:
@@ -146,20 +186,70 @@ class SUGOcc(Base3DSegmentor):
             t0 = time.time()
         if self.dataset == 'nuscenes':
             img = self.prepare_inputs(img)
-        x, _ = self.image_encoder(img[0], stereo=self.dataset == 'nuscenes')
+        x, stereo_feat = self.image_encoder(img[0], stereo=self.dataset == 'nuscenes')
         
         if self.record_time:
             torch.cuda.synchronize()
             t1 = time.time()
             self.time_stats['img_encoder'].append(t1 - t0)
 
-        # img: imgs, rots, trans, intrins, post_rots, post_trans, gt_depths, sensor2sensors
-        rots, trans, intrins, post_rots, post_trans, bda = img[1:7]
-        
-        mlp_input = self.img_view_transformer.get_mlp_input(rots, trans, intrins, post_rots, post_trans, bda)
-        geo_inputs = [rots, trans, intrins, post_rots, post_trans, bda, mlp_input]
+        if self.do_use_history:       
+            if self.history_stereo_feat is None:
+                self.history_stereo_feat = stereo_feat
+                self.history_img_metas = img_metas
+                self.history_img_inputs = img
 
-        x, depth, seg = self.img_view_transformer([x] + geo_inputs)
+            start_of_sequence = torch.BoolTensor([
+                img_meta['flag'] != self.history_img_metas[i]['flag'] \
+                    for i, img_meta in enumerate(img_metas)
+            ])
+            if start_of_sequence.sum() > 0:
+                bs = img[0].shape[0]
+                tem = stereo_feat.reshape(bs,stereo_feat.shape[0]//bs,*stereo_feat.shape[1:])[start_of_sequence].detach()
+                self.history_stereo_feat=self.history_stereo_feat.reshape(bs,self.history_stereo_feat.shape[0]//bs,*self.history_stereo_feat.shape[1:])
+                self.history_stereo_feat[start_of_sequence]=tem
+                self.history_stereo_feat=self.history_stereo_feat.reshape(*stereo_feat.shape)
+                
+            prev_stereo_feat = self.history_stereo_feat
+            prev_img = self.history_img_inputs
+            prev_img, curr2adjsensor = self.get_curr2adjsensor(img, prev_img, start_of_sequence)
+            self.history_stereo_feat = stereo_feat
+            self.history_img_metas = img_metas
+            self.history_img_inputs = img
+
+            stereo_metas = dict(k2s_sensor=curr2adjsensor,
+                intrins=prev_img[3],
+                post_rots=prev_img[4],
+                post_trans=prev_img[5],
+            #  frustum=self.cv_frustum.to(stereo_feat.device),
+                cv_downsample=4,
+                downsample=self.downsample,
+                grid_config=self.grid_config,
+                cv_feat_list=[prev_stereo_feat, stereo_feat])
+        else:
+            stereo_metas = None
+        
+        if self.dataset == "semantickitti":
+            # img: imgs, rots, trans, intrins, post_rots, post_trans, gt_depths, sensor2sensors
+            rots, trans, intrins, post_rots, post_trans, bda = img[1:7]
+            
+            mlp_input = self.img_view_transformer.get_mlp_input(rots, 
+                                                                trans, 
+                                                                intrins, 
+                                                                post_rots, 
+                                                                post_trans, 
+                                                                bda)
+        else:
+            sensor2egos, ego2globals, intrins, post_rots, post_trans, bda = img[1:7]
+            mlp_input = self.img_view_transformer.get_mlp_input_nus(sensor2egos, 
+                                                                    ego2globals, 
+                                                                    intrins, 
+                                                                    post_rots, 
+                                                                    post_trans, 
+                                                                    bda)
+        geo_inputs = [*img[1:7], mlp_input]
+        x, depth, seg = self.img_view_transformer([x] + geo_inputs, img_metas=img_metas, stereo_metas=stereo_metas)
+
 
         if self.record_time:
             torch.cuda.synchronize()
@@ -167,14 +257,16 @@ class SUGOcc(Base3DSegmentor):
             self.time_stats['view_transformer'].append(t2 - t1)
 
         x, voxel_seg_logits = self.bev_encoder(x)
+        ## TODO fuse x with self.history_voxel_feat
         if type(x) is not list:
             x = [x]
-        
+        if self.do_use_history:
+            self.history_voxel_feat = x[0].detach()
         return x, depth, seg, voxel_seg_logits
     
-    def extract_feat(self, points, img):
+    def extract_feat(self, points, img, img_metas=None):
         """Extract features from images and points."""
-        voxel_feats, depth, seg, voxel_seg_logits  = self.extract_img_feat(img)
+        voxel_feats, depth, seg, voxel_seg_logits  = self.extract_img_feat(img, img_metas=img_metas)
         return (voxel_feats, depth, seg, voxel_seg_logits)
 
     def _forward(self, batch_inputs: dict,
@@ -301,7 +393,7 @@ class SUGOcc(Base3DSegmentor):
             dict: Losses of different branches.
         """
         voxel_feats, depth, seg, voxel_seg_logits  = self.extract_feat(
-            points, img=img_inputs)
+            points, img=img_inputs, img_metas=img_metas)
 
         losses = dict()
         
@@ -351,24 +443,15 @@ class SUGOcc(Base3DSegmentor):
     
 
     def simple_test(self, img_metas, img=None, rescale=False, points_occ=None, points_uv=None):
-        if self.dataset == 'nuscenes':
-            img = self.prepare_inputs(img)
-        x, _ = self.image_encoder(img[0], stereo=self.dataset == 'nuscenes')
+        voxel_feats, depth, seg, voxel_seg_logits  = self.extract_feat(
+            points_occ, img=img, img_metas=img_metas)
         
-        # img: imgs, rots, trans, intrins, post_rots, post_trans, gt_depths, sensor2sensors
-        rots, trans, intrins, post_rots, post_trans, bda = img[1:7]
-        
-        mlp_input = self.img_view_transformer.get_mlp_input(rots, trans, intrins, post_rots, post_trans, bda)
-        geo_inputs = [rots, trans, intrins, post_rots, post_trans, bda, mlp_input]
-        x, _, _ = self.img_view_transformer([x] + geo_inputs, img_metas=img_metas)
-        
-        x, _ = self.bev_encoder(x)
-        if type(x) is not list:
-            x = [x]
+        if type(voxel_feats) is not list:
+            voxel_feats = [voxel_feats]
 
         transform = img[1:] if img is not None else None
         output = self.pts_bbox_head.simple_test(
-            voxel_feats=x,
+            voxel_feats=voxel_feats,
             points=points_occ,
             img_metas=img_metas,
             points_uv=points_uv,

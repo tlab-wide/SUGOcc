@@ -56,14 +56,14 @@ class GroupInBatchSampler(Sampler):
 
     def __init__(
         self,
-        dataset=None,
+        sampler,
         batch_size=1,
         world_size=None,
         rank=None,
         seed=0,
         skip_prob=0.5,
         sequence_flip_prob=0.1,
-        sampler=None,
+        dataset=None,
         **kwargs,
     ):
         _rank, _world_size = get_dist_info()
@@ -88,6 +88,7 @@ class GroupInBatchSampler(Sampler):
         assert self.groups_num >= self.global_batch_size
 
         # Now, for efficiency, make a dict group_idx: List[dataset sample_idxs]
+        
         self.group_idx_to_sample_idxs = {
             group_idx: np.where(self.flag == group_idx)[0].tolist()
             for group_idx in range(self.groups_num)
@@ -125,12 +126,12 @@ class GroupInBatchSampler(Sampler):
     def __iter__(self):
         while True:
             curr_batch = []
-            # print(self.group_idx_to_sample_idxs)
+            # print(self.groups_num, self.group_idx_to_sample_idxs)
             for local_sample_idx in range(self.batch_size):
                 skip = (
                     np.random.uniform() < self.skip_prob
                     and len(self.buffer_per_local_sample[local_sample_idx]) > 1
-                )
+                ) 
                 if len(self.buffer_per_local_sample[local_sample_idx]) == 0:
                     # Finished current group, refill with next group
                     # skip = False
@@ -144,7 +145,7 @@ class GroupInBatchSampler(Sampler):
                     ] = copy.deepcopy(
                         self.group_idx_to_sample_idxs[new_group_idx]
                     )
-                    # print(self.buffer_per_local_sample)
+                    
                     if np.random.uniform() < self.sequence_flip_prob:
                         self.buffer_per_local_sample[
                             local_sample_idx
@@ -163,6 +164,7 @@ class GroupInBatchSampler(Sampler):
 
                 if skip:
                     self.buffer_per_local_sample[local_sample_idx].pop(0)
+                # print(local_sample_idx, self.buffer_per_local_sample)
                 curr_batch.append(
                     dict(
                         idx=self.buffer_per_local_sample[local_sample_idx].pop(

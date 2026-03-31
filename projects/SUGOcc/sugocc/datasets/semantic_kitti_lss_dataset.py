@@ -23,7 +23,7 @@ class CustomSemanticKITTILssDataset(BaseDataset):
         self.data_root = data_root
         self.camera_map = {'left': '2', 'right': '3'}
         self.camera_used = [self.camera_map[camera] for camera in camera_used]
-        self.multi_scales = ["1_1", "1_2", "1_4", "1_8"]
+        self.multi_scales = ["1_1", "1_2", "1_4", "1_8", "1_16"]
         
         self.load_continuous = load_continuous
         self.splits = {

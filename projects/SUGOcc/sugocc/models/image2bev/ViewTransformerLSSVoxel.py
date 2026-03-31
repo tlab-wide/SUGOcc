@@ -124,7 +124,10 @@ class CM_DepthNet(BaseModule):
                  mid_channels=512,
                  use_dcn=True,
                  downsample=16,
+                 stereo=False,
                  grid_config=None,
+                 bias=0.0,
+                 input_size=None,
                  loss_depth_weight=3.0,
                  with_cp=False,
                  se_depth_map=False,
@@ -140,6 +143,7 @@ class CM_DepthNet(BaseModule):
         self.downsample = downsample
         self.grid_config = grid_config
         self.loss_depth_weight = loss_depth_weight
+        self.stereo = stereo
         self.reduce_conv = nn.Sequential(
             nn.Conv2d(
                 in_channels, mid_channels, kernel_size=3, stride=1, padding=1),
@@ -157,11 +161,31 @@ class CM_DepthNet(BaseModule):
         self.context_mlp = Mlp(cam_channel, mid_channels, mid_channels)
         self.context_se = SELayer(mid_channels)  # NOTE: add camera-aware
         depth_conv_input_channels = mid_channels
-        downsample = None
+        downsample_net = None
         self.num_class = num_class
+
+        self.depth_stereo=stereo
+        if stereo:
+            cost_volumn_channels=depth_channels
+            depth_conv_input_channels += cost_volumn_channels
+            downsample_net = nn.Conv2d(depth_conv_input_channels,
+                                    mid_channels, 1, 1, 0)
+            cost_volumn_net = []
+            for stage in range(int(2)):
+                cost_volumn_net.extend([
+                    nn.Conv2d(cost_volumn_channels, cost_volumn_channels, kernel_size=3,
+                            stride=2, padding=1),
+                    nn.BatchNorm2d(cost_volumn_channels)])
+            self.cost_volumn_net = nn.Sequential(*cost_volumn_net)
+            
+            self.bias = bias
+        
+            self.cv_frustum = self.create_frustum(grid_config['dbound'],
+                                                    input_size,
+                                                    downsample=self.downsample//4)
         depth_conv_list = [
            BasicBlock(depth_conv_input_channels, mid_channels,
-                                      downsample=downsample),
+                                      downsample=downsample_net),
             BasicBlock(mid_channels, mid_channels),
             BasicBlock(mid_channels, mid_channels),
         ]
@@ -202,11 +226,126 @@ class CM_DepthNet(BaseModule):
                 nn.Conv2d(self.context_channels * 2, self.num_class, kernel_size=1, stride=1, padding=0)
                 )
 
-    def forward(self, x, mlp_input):
+    def create_frustum(self, depth_cfg, input_size, downsample):
+        """Generate the frustum template for each image.
+
+        Args:
+            depth_cfg (tuple(float)): Config of grid alone depth axis in format
+                of (lower_bound, upper_bound, interval).
+            input_size (tuple(int)): Size of input images in format of (height,
+                width).
+            downsample (int): Down sample scale factor from the input size to
+                the feature size.
+        """
+        H_in, W_in = input_size
+        H_feat, W_feat = H_in // downsample, W_in // downsample
+        d = torch.arange(*depth_cfg, dtype=torch.float)\
+            .view(-1, 1, 1).expand(-1, H_feat, W_feat)
+        self.D = d.shape[0]
+        x = torch.linspace(0, W_in - 1, W_feat,  dtype=torch.float)\
+            .view(1, 1, W_feat).expand(self.D, H_feat, W_feat)
+        y = torch.linspace(0, H_in - 1, H_feat,  dtype=torch.float)\
+            .view(1, H_feat, 1).expand(self.D, H_feat, W_feat)
+
+        # D x H x W x 3
+        return torch.stack((x, y, d), -1)
+    
+    def gen_grid(self, metas, B, N, D, H, W, hi, wi):
+        # pass
+        frustum =self.cv_frustum.to(metas['post_trans'].device)
+
+        points = frustum - metas['post_trans'].view(B, N, 1, 1, 1, 3)
+        points = torch.inverse(metas['post_rots']).view(B, N, 1, 1, 1, 3, 3) \
+            .matmul(points.unsqueeze(-1))
+        points = torch.cat(
+            (points[..., :2, :] * points[..., 2:3, :], points[..., 2:3, :]), 5)
+
+        rots = metas['k2s_sensor'][:, :, :3, :3].contiguous()
+        trans = metas['k2s_sensor'][:, :, :3, 3].contiguous()
+        combine = rots.matmul(torch.inverse(metas['intrins']))
+
+        points = combine.view(B, N, 1, 1, 1, 3, 3).matmul(points)
+        points += trans.view(B, N, 1, 1, 1, 3, 1)
+        neg_mask = points[..., 2, 0] < 1e-3
+        points = metas['intrins'].view(B, N, 1, 1, 1, 3, 3).matmul(points)
+        points = points[..., :2, :] / points[..., 2:3, :]
+
+        points = metas['post_rots'][...,:2,:2].view(B, N, 1, 1, 1, 2, 2).matmul(
+            points).squeeze(-1)
+        points += metas['post_trans'][...,:2].view(B, N, 1, 1, 1, 2)
+
+        px = points[..., 0] / (wi - 1.0) * 2.0 - 1.0
+        py = points[..., 1] / (hi - 1.0) * 2.0 - 1.0
+        px[neg_mask] = -2
+        py[neg_mask] = -2
+        grid = torch.stack([px, py], dim=-1)
+        grid = grid.view(B * N, D * H, W, 2)
+        return grid
+
+
+    def calculate_cost_volumn(self, metas):
+        prev, curr = metas['cv_feat_list']
+        
+        group_size = 4
+        _, c, hf, wf = curr.shape
+        hi, wi = hf * 4, wf * 4
+        B, N, _ = metas['post_trans'].shape
+        D, H, W, _ = self.cv_frustum.shape
+        # self.gen_grid(metas, B, N, D, H, W, hi, wi)
+        grid = self.gen_grid(metas, B, N, D, H, W, hi, wi).to(curr.dtype)
+
+        prev = prev.view(B * N, -1, H, W)
+        curr = curr.view(B * N, -1, H, W)
+        cost_volumn = 0
+      
+        for fid in range(curr.shape[1] // group_size):
+            prev_curr = prev[:, fid * group_size:(fid + 1) * group_size, ...]
+            warp_prev = F.grid_sample(prev_curr, grid,
+                                      align_corners=True,
+                                      padding_mode='zeros')
+            curr_tmp = curr[:, fid * group_size:(fid + 1) * group_size, ...]
+            cost_volumn_tmp = curr_tmp.unsqueeze(2) - \
+                              warp_prev.view(B * N, -1, D, H, W)
+            cost_volumn_tmp = cost_volumn_tmp.abs().sum(dim=1)
+            cost_volumn += cost_volumn_tmp
+       
+        if not self.bias == 0:
+            invalid = warp_prev[:, 0, ...].view(B * N, D, H, W) == 0
+           
+            cost_volumn[invalid] = cost_volumn[invalid] + self.bias
+           
+        cost_volumn = - cost_volumn
+        cost_volumn = cost_volumn.softmax(dim=1)
+        
+        
+        return cost_volumn
+    
+    def forward(self, x, mlp_input, stereo_metas=None, img_metas=None):
         x = x.to(torch.float32)
-        mlp_input = self.bn(mlp_input.reshape(-1, mlp_input.shape[-1])) 
         # B * N, C, H, W = x.shape
-        # x = x.view(B * N, C, H, W) 
+        # x = x.view(B * N, C, H, W)
+        cost_volumn = None
+        if self.depth_stereo:
+            if stereo_metas['cv_feat_list'][0] is None:
+                BN, _, H, W = x.shape
+                scale_factor = float(stereo_metas['downsample'])/\
+                               stereo_metas['cv_downsample']
+                cost_volumn_ = \
+                    torch.zeros((BN, self.depth_channels,
+                                 int(H*scale_factor),
+                                 int(W*scale_factor))).to(x)
+            else:
+                with torch.no_grad():
+                    cost_volumn_ = self.calculate_cost_volumn(stereo_metas)
+                if cost_volumn is not None:
+                    cost_volumn=torch.cat((cost_volumn,cost_volumn_),dim=1)
+                else:
+                    cost_volumn=cost_volumn_
+        if cost_volumn is not None:
+            cost_volumn = self.cost_volumn_net(cost_volumn)
+            
+        mlp_input = self.bn(mlp_input.reshape(-1, mlp_input.shape[-1])) 
+        
         if self.with_cp and x.requires_grad:
             x = cp.checkpoint(self.reduce_conv, x)
         else:
@@ -219,8 +358,8 @@ class CM_DepthNet(BaseModule):
         context = self.context_conv(context) 
         depth_se = self.depth_mlp(mlp_input)[..., None, None] 
         depth = self.depth_se(x, depth_se)
-
-
+        if cost_volumn is not None:
+            depth = torch.cat([depth, cost_volumn], dim=1)
         if self.with_cp and depth.requires_grad:
             depth = cp.checkpoint(self.depth_conv, depth)
         else:
@@ -301,7 +440,7 @@ class SegAndDepthNet(nn.Module):
             padding=0)
 
     # @auto_fp16()
-    def forward(self, x, mlp_input):
+    def forward(self, x, mlp_input, **kwargs):
         mlp_input = self.bn(mlp_input.reshape(-1, mlp_input.shape[-1]))
         x = self.reduce_conv(x)
         context_se = self.context_mlp(mlp_input)[..., None, None]
@@ -749,15 +888,12 @@ class ViewTransformerLiftSplatShootVoxel(ViewTransformerLSSBEVDepth):
         mlp_input = torch.cat([mlp_input, sensor2ego], dim=-1)
         return mlp_input
     
-    def forward(self, input, img_metas=None):
+    def forward(self, input, img_metas=None, stereo_metas=None):
         (x, rots, trans, intrins, post_rots, post_trans, bda, mlp_input) = input[:8]
         B, N, C, H, W = x.shape
 
         x = x.view(B * N, C, H, W)
-        if self.dataset == 'nuscenes':
-            mlp_input = self.get_mlp_input_nus(*input[1:7])
-
-        x, seg_out = self.depth_net(x, mlp_input)     
+        x, seg_out = self.depth_net(x, mlp_input, stereo_metas=stereo_metas)     
 
         depth_digit = x[:, :self.D, ...]
         img_feat = x[:, self.D:self.D + self.numC_Trans, ...]
@@ -767,7 +903,6 @@ class ViewTransformerLiftSplatShootVoxel(ViewTransformerLSSBEVDepth):
            
         hazard = torch.cumsum(depth_prob, dim=1)
 
-        
         seg_mask = (1-seg_prob[:,self.empty_idx,...] > self.seg_pruning_ratio).unsqueeze(1).repeat(1, self.D, 1, 1)
         mask = (hazard > self.depth_pruning_ratio)&(seg_mask)
         
@@ -788,12 +923,7 @@ class ViewTransformerLiftSplatShootVoxel(ViewTransformerLSSBEVDepth):
 
             bev_feat = self.voxel_pooling(geom, volume)
         elif self.dataset == 'nuscenes':
-            if self.accelerate:
-                self.pre_compute(input)
-                geom = self.get_ego_coor(*input[1:7])
-            else:
-
-                geom = self.get_ego_coor(*input[1:7])
+            geom = self.get_ego_coor(*input[1:7])
                 
             opacity_embeds = opacity_embeds.view(B, N, -1, self.D, H, W)
             dist_embed = opacity_embeds

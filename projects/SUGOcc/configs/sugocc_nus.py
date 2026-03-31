@@ -315,7 +315,7 @@ input_modality = dict(
     use_external=False)
 
 train_dataloader = dict(
-    batch_size=1,
+    batch_size=2,
     num_workers=8,
     persistent_workers=True,
     sampler=dict(type='DefaultSampler', shuffle=True, seed=0),

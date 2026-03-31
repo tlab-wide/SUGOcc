@@ -120,8 +120,32 @@ class CustomNuScenesDatasetOccupancy(BaseDataset):
                  multi_adj_frame_id_cfg=None,
                  ego_cam='CAM_FRONT',
                  stereo=False,
+                 sequences_split_num=1,
+                 keep_consistent_seq_aug=False,
                  occ_size=(160, 160, 16),
-                 pc_range=[-51.2, -51.2, -5.0, 51.2, 51.2, 3.0]):
+                 pc_range=[-51.2, -51.2, -5.0, 51.2, 51.2, 3.0],
+                 data_config={
+                    'cams': [
+                        'CAM_FRONT_LEFT', 'CAM_FRONT', 'CAM_FRONT_RIGHT', 'CAM_BACK_LEFT',
+                        'CAM_BACK', 'CAM_BACK_RIGHT'
+                    ],
+                    'Ncams': 6,
+                    'input_size': (256, 704),
+                    'src_size': (900, 1600),
+
+                    # Augmentation
+                    'resize': (-0.06, 0.11),
+                    'rot': (-5.4, 5.4),
+                    'flip': True,
+                    'crop_h': (0.0, 0.0),
+                    'resize_test': 0.00,
+                },
+                bda_aug_conf=dict(
+                    rot_lim=(-0, 0),
+                    scale_lim=(1., 1.),
+                    flip_dx_ratio=0.5,
+                    flip_dy_ratio=0.5),
+            ):
         self.load_interval = load_interval
         self.use_valid_flag = use_valid_flag
         self.modality = modality
@@ -154,8 +178,11 @@ class CustomNuScenesDatasetOccupancy(BaseDataset):
         self.multi_adj_frame_id_cfg = multi_adj_frame_id_cfg
         self.ego_cam = ego_cam
         self.stereo = stereo
-        # self.sequences_split_num = 1
-        # self._set_sequence_group_flag() 
+        self.sequences_split_num = sequences_split_num
+        self.data_config = data_config
+        self.bda_aug_conf = bda_aug_conf
+        self.keep_consistent_seq_aug = keep_consistent_seq_aug
+        self._set_sequence_group_flag() 
 
     def get_cat_ids(self, idx):
         info = self.data_list[idx]
@@ -214,6 +241,70 @@ class CustomNuScenesDatasetOccupancy(BaseDataset):
                 assert len(new_flags) == len(self.flag)
                 self.flag = np.array(new_flags, dtype=np.int64)
 
+    def sample_augmentation(self, H, W, flip=None, scale=None):
+        """
+        Args:
+            H:
+            W:
+            flip:
+            scale:
+        Returns:
+            resize: resize比例float.
+            resize_dims: (resize_W, resize_H)
+            crop: (crop_w, crop_h, crop_w + fW, crop_h + fH)
+            flip: 0 / 1
+            rotate: 随机旋转角度float
+        """
+        fH, fW = self.data_config['input_size']
+        if not self.test_mode:
+            resize = float(fW) / float(W)
+            resize += np.random.uniform(*self.data_config['resize'])    # resize的比例, 位于[fW/W − 0.06, fW/W + 0.11]之间.
+            resize_dims = (int(W * resize), int(H * resize))            # resize后的size
+            newW, newH = resize_dims
+            crop_h = int((1 - np.random.uniform(*self.data_config['crop_h'])) *
+                         newH) - fH     # s * H - H_in
+            crop_w = int(np.random.uniform(0, max(0, newW - fW)))       # max(0, s * W - fW)
+            crop = (crop_w, crop_h, crop_w + fW, crop_h + fH)
+            
+            flip = self.data_config['flip'] and np.random.choice([0, 1])
+            rotate = np.random.uniform(*self.data_config['rot'])
+        else:
+            resize = float(fW) / float(W)
+            if scale is not None:
+                resize += scale
+            else:
+                resize += self.data_config.get('resize_test', 0.0)
+            resize_dims = (int(W * resize), int(H * resize))
+            newW, newH = resize_dims
+            crop_h = int((1 - np.mean(self.data_config['crop_h'])) * newH) - fH
+            crop_w = int(max(0, newW - fW) / 2)
+            crop = (crop_w, crop_h, crop_w + fW, crop_h + fH)
+            flip = False if flip is None else flip
+            rotate = 0
+        return resize, resize_dims, crop, flip, rotate
+    
+    def sample_bda_augmentation(self):
+        """Generate bda augmentation values based on bda_config."""
+        if not self.test_mode:
+            rotate_bda = np.random.uniform(*self.bda_aug_conf['rot_lim'])
+            scale_bda = np.random.uniform(*self.bda_aug_conf['scale_lim'])
+            flip_dx = np.random.uniform() < self.bda_aug_conf['flip_dx_ratio']
+            flip_dy = np.random.uniform() < self.bda_aug_conf['flip_dy_ratio']
+        else:
+            rotate_bda = 0
+            scale_bda = 1.0
+            flip_dx = False
+            flip_dy = False
+        return rotate_bda, scale_bda, flip_dx, flip_dy
+    
+    def get_augmentation(self):
+        """Get the augmentation config dict for current sample."""
+        aug_config = {}
+        H, W = self.data_config['src_size']
+        aug_config['resize'], aug_config['resize_dims'], aug_config['crop'], aug_config['flip'], aug_config['rotate'] = self.sample_augmentation(H, W)
+        aug_config['rotate_bda'], aug_config['scale_bda'], aug_config['flip_dx_bda'], aug_config['flip_dy_bda'] = self.sample_bda_augmentation()
+        return aug_config
+
     def prepare_test_data(self, index):
         """
         Training data preparation.
@@ -234,15 +325,18 @@ class CustomNuScenesDatasetOccupancy(BaseDataset):
         
         return example
 
-    def prepare_train_data(self, index):
+    def prepare_train_data(self, index, aug_config=None):
         """
         Training data preparation.
         Args:
             index (int): Index for accessing the target data.
+            aug_config (dict, optional): Augmentation configuration.
         Returns:
             dict: Training data dict of the corresponding index.
         """
         input_dict = self.get_data_info(index)
+        if aug_config is not None:
+            input_dict['aug_config'] = aug_config
         if input_dict is None:
             print('found None in training data')
             return None
@@ -254,18 +348,20 @@ class CustomNuScenesDatasetOccupancy(BaseDataset):
         return example
 
     def __getitem__(self, idx):
-        
         if isinstance(idx, dict):
             aug_config = idx["aug_config"]
             idx = idx["idx"]
+        else:
+            aug_config = None
         if self.test_mode:
             return self.prepare_test_data(idx)
         while True:
-            data = self.prepare_train_data(idx)
+            data = self.prepare_train_data(idx, aug_config=aug_config)
             if data is None:
                 print(f'found None in training data, re-sampling a new one')
                 idx = self._rand_another(idx)
                 continue
+            # data.update({"aug_config": aug_config})
             return data
         
     def get_data_info(self, index):
@@ -278,6 +374,7 @@ class CustomNuScenesDatasetOccupancy(BaseDataset):
             lidar_points={'lidar_path': info['lidar_path']},
             sweeps=info['sweeps'],
             timestamp=info['timestamp'] / 1e6,
+            flag=self.flag[index],
         )
         if 'ann_infos' in info:
             input_dict['ann_infos'] = info['ann_infos']
@@ -318,7 +415,7 @@ class CustomNuScenesDatasetOccupancy(BaseDataset):
                     input_dict.update(dict(adjacent=info_adj_list))
         if self.test_mode:
             input_dict['eval_ann_info'] = dict()
-            input_dict['eval_ann_info']['occ_gt_path'] = self.data_list[index]['occ_path']
+            input_dict['eval_ann_info']['occ_gt_path'] = os.path.join(self.data_list[index]['occ_path'], "labels.npz")
         input_dict['occ_gt_path'] = self.data_list[index]['occ_path']
         return input_dict
 

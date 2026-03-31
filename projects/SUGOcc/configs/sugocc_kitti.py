@@ -1,5 +1,3 @@
-_base_ = ['../../../configs/_base_/default_runtime.py']
-
 custom_imports = dict(imports=['projects.SUGOcc.sugocc'], allow_failed_imports=False)
 
 backend_args = None
@@ -57,7 +55,9 @@ mask2former_num_queries = 100
 mask2former_feat_channel = voxel_out_channels
 mask2former_output_channel = voxel_out_channels
 mask2former_pos_channel = mask2former_feat_channel / 3 # divided by ndim
-mask2former_num_heads = 8
+
+## historical mistake, for new training, please set mask2former_num_heads=8
+mask2former_num_heads = voxel_out_channels//32
 
 model = dict(
     type='SUGOcc',
@@ -90,6 +90,7 @@ model = dict(
     ),
     img_bev_encoder_backbone=dict(
         type='MinkowskiUNetEncoder',
+        numC_input=voxel_out_channels,
         in_channels=voxel_channels,
         num_blocks=[2,2,2,2],
         num_dense_blocks=3,

@@ -82,18 +82,18 @@ def multiscale_supervision(gt_occ, ratio, gt_shape):
         gt[i, coords[:, 0], coords[:, 1], coords[:, 2]] =  gt_pts[i][:, 3]
     return gt
 
-def geo_scal_loss(pred, ssc_target, ignore_index=255, non_empty_idx=0):
+def geo_scal_loss(pred, ssc_target, ignore_index=255, empty_idx=0):
     with autocast(enabled=False):
         # Get softmax probabilities
         pred = F.softmax(pred, dim=1)
 
         # Compute empty and nonempty probabilities
-        empty_probs = pred[:, non_empty_idx]
+        empty_probs = pred[:, empty_idx]
         nonempty_probs = 1 - empty_probs
 
         # Remove unknown voxels
         mask = ssc_target != ignore_index
-        nonempty_target = ssc_target != non_empty_idx
+        nonempty_target = ssc_target != empty_idx
         nonempty_target = nonempty_target[mask].float()
         nonempty_probs = nonempty_probs[mask]
         empty_probs = empty_probs[mask]
